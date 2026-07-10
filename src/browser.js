@@ -65,12 +65,20 @@ async function isStillLoginPage(page) {
 
 /**
  * 等待用户完成登录，使用内容检测而非纯 URL 检测
- * @returns {boolean} 是否登录成功
+ * 不设超时上限 — 浏览器保持打开，直到用户登录成功
+ * @returns {boolean} 始终返回 true（无限等待直到登录成功）
  */
-async function waitForLogin(page, timeoutMs) {
-  const startTime = Date.now();
-  while (Date.now() - startTime < timeoutMs) {
+async function waitForLogin(page) {
+  let waitMinutes = 0;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
     await new Promise((r) => setTimeout(r, 3000));
+    waitMinutes += 0.05; // ~3s
+
+    // 每分钟打印一次提示
+    if (Math.floor(waitMinutes) > Math.floor(waitMinutes - 0.05) && Math.floor(waitMinutes) > 0) {
+      console.log(`[浏览器] ⏳ 已等待 ${Math.floor(waitMinutes)} 分钟，浏览器保持打开中，请完成登录...`);
+    }
 
     const stillLogin = await isStillLoginPage(page);
     if (!stillLogin) {
@@ -85,7 +93,6 @@ async function waitForLogin(page, timeoutMs) {
       console.log('[浏览器] 页面又回到登录状态，继续等待...');
     }
   }
-  return false;
 }
 
 // ─── 浏览器连接 / 启动 ─────────────────────────────────────────────
@@ -315,14 +322,12 @@ function copyChromeState(src, dest) {
  */
 async function launchForLogin() {
   const localDataDir = config.browser.localDataDir;
-  const timeoutMs = config.browser.loginTimeoutSeconds * 1000;
 
   if (!fs.existsSync(localDataDir)) {
     fs.mkdirSync(localDataDir, { recursive: true });
   }
 
   console.log('[浏览器] 打开浏览器...');
-  console.log(`[浏览器] 登录超时: ${config.browser.loginTimeoutSeconds} 秒`);
 
   const context = await chromium.launchPersistentContext(localDataDir, {
     headless: false,
@@ -350,13 +355,9 @@ async function launchForLogin() {
 
   if (needLogin) {
     console.log('[浏览器] ⏳ 需要登录，请在浏览器中完成登录...');
-    console.log('[浏览器] 登录成功后会自动跳转回直播列表页面');
+    console.log('[浏览器] 浏览器会保持打开，不会自动关闭，登录成功后自动继续');
 
-    const ok = await waitForLogin(page, timeoutMs);
-    if (!ok) {
-      console.error('[浏览器] ❌ 登录超时，请重新运行');
-      process.exit(1);
-    }
+    await waitForLogin(page);
 
     // 确保最终停留在直播列表页
     await page.waitForTimeout(2000);
@@ -366,11 +367,6 @@ async function launchForLogin() {
       console.log('[浏览器] 重新导航到直播列表...');
       await page.goto(config.taobao.liveListUrl, { waitUntil: 'networkidle', timeout: 60000 });
       await page.waitForTimeout(5000);
-      // 再次确认
-      if (await isStillLoginPage(page)) {
-        console.error('[浏览器] ❌ 导航后仍在登录页，请重新运行');
-        process.exit(1);
-      }
     }
   } else {
     console.log('[浏览器] ✅ 已有登录态，直接进入直播列表');
@@ -397,16 +393,11 @@ async function enterLiveRoom(page) {
   }
   await page.waitForTimeout(5000); // 等待页面完全渲染
 
-  // 如果被重定向到登录页，等待用户登录（内容检测）
+  // 如果被重定向到登录页，等待用户登录（内容检测，无限等待）
   if (await isStillLoginPage(page)) {
     console.log('[浏览器] ⏳ 页面需要登录，请在浏览器中完成登录...');
-    const timeoutMs = config.browser.loginTimeoutSeconds * 1000;
-    const ok = await waitForLogin(page, timeoutMs);
-
-    if (!ok) {
-      console.error('[浏览器] ❌ 登录超时');
-      return false;
-    }
+    console.log('[浏览器] 浏览器会保持打开，不会自动关闭');
+    await waitForLogin(page);
 
     // 确保在直播列表页
     if (!page.url().includes('liveplatform.taobao.com')) {

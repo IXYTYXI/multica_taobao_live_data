@@ -135,16 +135,21 @@ async function main() {
     // 1. 启动/连接浏览器
     const { browser, context, page } = await launchBrowser();
 
-    // 2. 进入直播间
-    const entered = await enterLiveRoom(page);
-    if (!entered) {
-      console.error('[错误] 未能进入直播中控台，请确保：');
-      console.error('  1. 已登录淘宝直播中控台');
-      console.error('  2. 有正在直播的场次');
-      if (config.browser.mode === 'cdp') {
-        console.error('  3. Chrome 以 --remote-debugging-port=9222 启动');
+    // 2. 进入直播间（未找到直播场次时持续重试，不关闭浏览器）
+    let entered = false;
+    while (!entered) {
+      entered = await enterLiveRoom(page);
+      if (!entered) {
+        console.log('[主程序] 未找到正在直播的场次，30 秒后重新检查...');
+        console.log('[主程序] 浏览器保持打开，如需登录请在浏览器中操作');
+        await new Promise((r) => setTimeout(r, 30000));
+        // 重新加载页面
+        try {
+          await page.goto(config.taobao.liveListUrl, { waitUntil: 'networkidle', timeout: 60000 });
+        } catch (e) {
+          console.log('[主程序] 页面加载异常，继续重试:', e.message);
+        }
       }
-      process.exit(1);
     }
 
     // 3. 开始监控循环
