@@ -22,7 +22,7 @@ const config = {
      *   "profile" — 复制本机 Chrome 的用户数据目录来继承登录态（推荐）
      *   "login"   — 打开全新浏览器，等待用户手动登录后继续
      */
-    mode: (process.env.BROWSER_MODE || 'profile').toLowerCase(),
+    mode: (process.env.BROWSER_MODE || 'login').toLowerCase(),
 
     // CDP 模式的调试端口
     debugPort: parseInt(process.env.CHROME_DEBUG_PORT || '9222', 10),

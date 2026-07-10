@@ -87,9 +87,10 @@ async function launchCDP() {
 /**
  * 模式 2: profile — 使用本机 Chrome 用户数据目录（继承 cookie）
  *
- * Playwright 的 launchPersistentContext 会锁定 userDataDir，
- * 所以如果 Chrome 正在运行则无法直接用原目录。
- * 解决方法：将用户目录里的关键 cookie/storage 文件复制到工具自己的目录下。
+ * 注意：Chrome 运行时会以 EXCLUSIVE 模式锁定 cookies 文件，
+ * 所有 Windows API（包括 .NET FileShare.ReadWrite、robocopy）均无法读取。
+ * 因此 profile 模式要求先关闭 Chrome 再运行本工具。
+ * 如果不想关闭 Chrome，请使用 login 模式（BROWSER_MODE=login）。
  */
 async function launchWithProfile() {
   let chromeUserDataDir = config.browser.chromeUserDataDir || guessChromePath();
@@ -98,25 +99,47 @@ async function launchWithProfile() {
   console.log(`[浏览器] Chrome 用户数据目录: ${chromeUserDataDir}`);
   console.log(`[浏览器] 本工具数据目录: ${localDataDir}`);
 
-  // 确保本工具数据目录存在
+  // 检查 Chrome 是否正在运行
+  const { execSync } = require('child_process');
+  let chromeRunning = false;
+  if (os.platform() === 'win32') {
+    try {
+      const out = execSync('tasklist /FI "IMAGENAME eq chrome.exe" /NH', { encoding: 'utf8' });
+      chromeRunning = out.includes('chrome.exe');
+    } catch {}
+  } else {
+    try {
+      execSync('pgrep -x chrome', { stdio: 'ignore' });
+      chromeRunning = true;
+    } catch {}
+  }
+
+  if (chromeRunning) {
+    console.log('[浏览器] ⚠ 检测到 Chrome 正在运行！');
+    console.log('[浏览器] Chrome 会以独占模式锁定 cookie 文件，profile 模式无法复制。');
+    console.log('[浏览器] 自动切换到 login 模式...');
+    console.log('');
+    return await launchForLogin();
+  }
+
+  // Chrome 未运行，安全复制 cookie
   if (!fs.existsSync(localDataDir)) {
     fs.mkdirSync(localDataDir, { recursive: true });
   }
 
-  // 把 Chrome 的 cookie / Local State 复制过来以继承登录态
   copyChromeState(chromeUserDataDir, localDataDir);
 
   console.log('[浏览器] 使用复制的 Chrome profile 启动（有头模式）...');
   const context = await chromium.launchPersistentContext(localDataDir, {
     headless: false,
-    channel: 'chrome', // 使用系统安装的 Chrome（而非 bundled Chromium）
+    channel: 'chrome',
     args: [
       '--disable-blink-features=AutomationControlled',
       '--no-first-run',
       '--no-default-browser-check',
     ],
     ignoreDefaultArgs: ['--enable-automation'],
-    viewport: null, // 使用系统窗口大小
+    viewport: null,
   });
 
   const pages = context.pages();
@@ -128,8 +151,10 @@ async function launchWithProfile() {
 
 /**
  * 从 Chrome 用户目录复制关键文件到工具目录
+ * 使用 robocopy（Windows）兜底处理被锁定的文件
  */
 function copyChromeState(src, dest) {
+  const { execSync } = require('child_process');
   const defaultProfile = path.join(src, 'Default');
   const destDefault = path.join(dest, 'Default');
 
@@ -142,47 +167,84 @@ function copyChromeState(src, dest) {
     fs.mkdirSync(destDefault, { recursive: true });
   }
 
-  // 需要复制的文件（cookie + storage + login state）
-  const filesToCopy = [
-    'Cookies',
-    'Cookies-journal',
-    'Login Data',
-    'Login Data-journal',
-    'Web Data',
-    'Web Data-journal',
-    'Preferences',
-    'Secure Preferences',
+  // 复制单个文件，先尝试 fs.copyFileSync，失败则用 robocopy（Windows）
+  function safeCopy(srcFile, destFile, label) {
+    if (!fs.existsSync(srcFile)) return false;
+    try {
+      fs.copyFileSync(srcFile, destFile);
+      console.log(`[浏览器] 复制 ${label} 成功`);
+      return true;
+    } catch (e) {
+      // 文件被锁定，在 Windows 上尝试 robocopy（可复制被占用的文件）
+      if (os.platform() === 'win32') {
+        try {
+          const srcDir = path.dirname(srcFile);
+          const destDir = path.dirname(destFile);
+          const fileName = path.basename(srcFile);
+          execSync(`robocopy "${srcDir}" "${destDir}" "${fileName}" /R:1 /W:0 /NP /NFL /NDL /NJH /NJS`, {
+            stdio: 'ignore',
+            timeout: 5000,
+          });
+          if (fs.existsSync(destFile)) {
+            console.log(`[浏览器] 复制 ${label} 成功（通过 robocopy）`);
+            return true;
+          }
+        } catch {
+          // robocopy 返回非 0 退出码是正常的（1=文件已复制, 0=无变化）
+          if (fs.existsSync(destFile)) {
+            console.log(`[浏览器] 复制 ${label} 成功（通过 robocopy）`);
+            return true;
+          }
+        }
+      }
+      console.log(`[浏览器] 复制 ${label} 失败（Chrome 可能正在使用）: ${e.message}`);
+      return false;
+    }
+  }
+
+  // Default 目录下的文件
+  const defaultFiles = [
+    'Cookies', 'Cookies-journal',
+    'Login Data', 'Login Data-journal',
+    'Web Data', 'Web Data-journal',
+    'Preferences', 'Secure Preferences',
   ];
 
-  // 顶层文件
-  const topFiles = ['Local State'];
-
-  for (const file of filesToCopy) {
-    const srcFile = path.join(defaultProfile, file);
-    const destFile = path.join(destDefault, file);
-    if (fs.existsSync(srcFile)) {
-      try {
-        fs.copyFileSync(srcFile, destFile);
-      } catch (e) {
-        // Chrome 正在使用文件时可能 EPERM，可以忽略
-        console.log(`[浏览器] 复制 ${file} 失败（Chrome 可能正在使用）: ${e.message}`);
-      }
-    }
+  for (const file of defaultFiles) {
+    safeCopy(
+      path.join(defaultProfile, file),
+      path.join(destDefault, file),
+      `Default/${file}`
+    );
   }
 
-  for (const file of topFiles) {
-    const srcFile = path.join(src, file);
-    const destFile = path.join(dest, file);
-    if (fs.existsSync(srcFile)) {
-      try {
-        fs.copyFileSync(srcFile, destFile);
-      } catch (e) {
-        console.log(`[浏览器] 复制 ${file} 失败: ${e.message}`);
-      }
+  // Network 子目录下的 cookie 文件（Chrome 新版路径）
+  const srcNetwork = path.join(defaultProfile, 'Network');
+  const destNetwork = path.join(destDefault, 'Network');
+  if (fs.existsSync(srcNetwork)) {
+    if (!fs.existsSync(destNetwork)) {
+      fs.mkdirSync(destNetwork, { recursive: true });
     }
+    safeCopy(
+      path.join(srcNetwork, 'Cookies'),
+      path.join(destNetwork, 'Cookies'),
+      'Network/Cookies'
+    );
+    safeCopy(
+      path.join(srcNetwork, 'Cookies-journal'),
+      path.join(destNetwork, 'Cookies-journal'),
+      'Network/Cookies-journal'
+    );
   }
 
-  console.log('[浏览器] Chrome 登录态文件已复制');
+  // 顶层 Local State
+  safeCopy(
+    path.join(src, 'Local State'),
+    path.join(dest, 'Local State'),
+    'Local State'
+  );
+
+  console.log('[浏览器] Chrome 登录态文件复制完成');
 }
 
 /**
