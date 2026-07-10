@@ -20,8 +20,12 @@ const FEISHU_BASE = 'https://open.feishu.cn/open-apis';
  */
 function toTimestampMs(dateStr) {
   if (!dateStr) return null;
-  const d = dayjs.tz(dateStr, 'YYYY-MM-DD HH:mm:ss', 'Asia/Shanghai');
-  return d.isValid() ? d.valueOf() : null;
+  try {
+    const d = dayjs.tz(dateStr, 'YYYY-MM-DD HH:mm:ss', 'Asia/Shanghai');
+    return d.isValid() ? d.valueOf() : null;
+  } catch {
+    return null;
+  }
 }
 
 let cachedToken = null;

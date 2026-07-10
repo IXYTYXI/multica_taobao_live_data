@@ -701,7 +701,7 @@ async function extractOrderFromPopup(page) {
     if (!dialogText) return null;
 
     let orderNumber = '';
-    const orderMatch = dialogText.match(/订单[号编]?\s*[：:]\s*(\d+)/);
+    const orderMatch = dialogText.match(/订单(?:编号|号)?\s*[：:]\s*(\d+)/);
     if (orderMatch) {
       orderNumber = orderMatch[1];
     } else {
