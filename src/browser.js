@@ -577,9 +577,18 @@ async function getRecentComments(page, withinMinutes) {
 
       if (commentMatch) {
         const [, nickname, userId, timeStr, content] = commentMatch;
-        const today = nowBeijing().format('YYYY-MM-DD');
-        const fullTimeStr = `${today} ${timeStr}`;
-        const commentTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+        const now = nowBeijing();
+        const today = now.format('YYYY-MM-DD');
+        let fullTimeStr = `${today} ${timeStr}`;
+        let commentTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+
+        // 跨午夜修正：如果拼出的时间比当前时间晚超过1小时，
+        // 说明评论实际来自前一天（如当前00:02, 评论23:58 → 拼成今天23:58是未来）
+        if (commentTime.isAfter(now.add(1, 'hour'))) {
+          const yesterday = now.subtract(1, 'day').format('YYYY-MM-DD');
+          fullTimeStr = `${yesterday} ${timeStr}`;
+          commentTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+        }
 
         if (commentTime.isAfter(cutoff)) {
           comments.push({

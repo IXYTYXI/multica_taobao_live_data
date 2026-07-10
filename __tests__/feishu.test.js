@@ -130,7 +130,7 @@ describe('feishu.js API 调用', () => {
     expect(body.fields['用户ID']).toBe('user_001');
     expect(body.fields['用户评论']).toBe('好看的');
     expect(body.fields['评论时间']).toBe('2026-07-10 14:30:00');
-    expect(body.fields['订单编号']).toBe('ORD123456789');
+    expect(body.fields['订单id']).toBe('ORD123456789');
     expect(body.fields['支付时间']).toBeGreaterThan(0); // 毫秒时间戳
   });
 
@@ -226,6 +226,6 @@ describe('feishu.js API 调用', () => {
     const body = writeCall[1];
     expect(body.records).toHaveLength(2);
     expect(body.records[0].fields['用户ID']).toBe('u1');
-    expect(body.records[1].fields['订单编号']).toBe('ORD001');
+    expect(body.records[1].fields['订单id']).toBe('ORD001');
   });
 });

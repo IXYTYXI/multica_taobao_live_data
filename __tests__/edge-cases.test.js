@@ -14,52 +14,74 @@ const BEIJING_TZ = 'Asia/Shanghai';
 
 describe('跨午夜评论时间边界', () => {
   /**
-   * browser.js getRecentComments 中使用 nowBeijing().format('YYYY-MM-DD') 拼接 today 日期
-   * 如果直播跨越午夜 (23:55 → 00:05)，00:05 时获取评论：
-   *   today = 新日期 (07-11)
-   *   评论时间 = "23:58" → 拼成 "07-11 23:58" → 实际上是昨天的 23:58
-   *   cutoff = 00:00 → "07-11 23:58" 在 cutoff 之后 → 被认为是近5分钟的评论
-   * 结果：23:58 的评论会被正确包含吗？
+   * 跨午夜修正逻辑：如果拼出的时间比当前时间晚超过1小时，
+   * 说明评论实际来自前一天，应减去1天。
    */
-  test('午夜后解析前一天的评论时间可能错误（已知限制）', () => {
-    // 模拟：当前北京时间是 2026-07-11 00:02:00
-    // 有一条评论显示时间 23:58（实际是前一天 07-10 的）
-    const today = '2026-07-11';
-    const commentTimeStr = '23:58:00';
-    const fullTimeStr = `${today} ${commentTimeStr}`;
-    const commentTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
 
-    // cutoff = 2026-07-11 00:02:00 - 5 分钟 = 2026-07-10 23:57:00
+  // 复现 browser.js getRecentComments 中的跨午夜修正逻辑
+  function parseCommentTime(commentTimeStr, nowTime) {
+    const today = nowTime.format('YYYY-MM-DD');
+    let fullTimeStr = `${today} ${commentTimeStr}`;
+    let commentTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+
+    // 跨午夜修正
+    if (commentTime.isAfter(nowTime.add(1, 'hour'))) {
+      const yesterday = nowTime.subtract(1, 'day').format('YYYY-MM-DD');
+      fullTimeStr = `${yesterday} ${commentTimeStr}`;
+      commentTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+    }
+
+    return commentTime;
+  }
+
+  test('午夜后正确将前一天的评论时间解析到昨天日期', () => {
+    // 当前北京时间是 2026-07-11 00:02:00
     const now = dayjs.tz('2026-07-11 00:02:00', 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
     const cutoff = now.subtract(5, 'minute');
 
-    // 评论时间被拼成 2026-07-11 23:58:00，这比 cutoff (2026-07-10 23:57:00) 晚
-    // 所以会被误判为"近期评论"，但实际上它是"明天 23:58"
-    // 这是一个已知的边界问题：跨午夜时 HH:mm 格式的评论时间会被拼到错误的日期
+    // 评论显示时间 23:58（实际是前一天 07-10 的）
+    const commentTime = parseCommentTime('23:58:00', now);
+
+    // 修正后应被解析为 2026-07-10 23:58:00
+    expect(commentTime.format('YYYY-MM-DD HH:mm:ss')).toBe('2026-07-10 23:58:00');
+    // 在 cutoff (2026-07-10 23:57:00) 之后，应被采集
     expect(commentTime.isAfter(cutoff)).toBe(true);
-
-    // 实际上这条评论应该被解析为 2026-07-10 23:58:00
-    const correctTime = dayjs.tz('2026-07-10 23:58:00', 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
-    expect(correctTime.isAfter(cutoff)).toBe(true); // 这个也应该在范围内
-
-    // 结论：跨午夜场景下虽然日期拼接错误（07-11 而非 07-10），
-    // 但由于被拼成了"未来的23:58"，isAfter(cutoff) 仍然为 true，
-    // 所以评论仍然会被采集到（行为上偶然正确，但日期记录错误）
   });
 
-  test('午夜前的评论时间在午夜后变成"未来时间"', () => {
-    const today = '2026-07-11'; // 当前日期已经是7月11日
-    const commentTimeStr = '23:55:00'; // 评论在昨天23:55
-
-    const fullTimeStr = `${today} ${commentTimeStr}`;
-    const parsedTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
-
-    // 当前时间是 00:02
+  test('午夜后正确将23:55评论解析到前一天', () => {
     const now = dayjs.tz('2026-07-11 00:02:00', 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
 
-    // 解析出的时间 (07-11 23:55) 比当前时间 (07-11 00:02) 晚约24小时
-    // 这意味着写入飞书的"评论时间"字段会是错误的日期
-    expect(parsedTime.isAfter(now)).toBe(true); // 未来时间！
+    const commentTime = parseCommentTime('23:55:00', now);
+
+    // 修正后应为前一天 07-10 23:55:00，而非未来时间
+    expect(commentTime.format('YYYY-MM-DD HH:mm:ss')).toBe('2026-07-10 23:55:00');
+    expect(commentTime.isBefore(now)).toBe(true); // 不再是未来时间
+  });
+
+  test('非跨午夜场景不受影响：当天14:30评论正常解析', () => {
+    const now = dayjs.tz('2026-07-11 15:00:00', 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+
+    const commentTime = parseCommentTime('14:30:00', now);
+
+    // 不触发修正，仍为当天日期
+    expect(commentTime.format('YYYY-MM-DD HH:mm:ss')).toBe('2026-07-11 14:30:00');
+  });
+
+  test('刚过午夜时当天00:01评论不被误修正到昨天', () => {
+    const now = dayjs.tz('2026-07-11 00:05:00', 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+
+    const commentTime = parseCommentTime('00:01:00', now);
+
+    // 00:01 距当前00:05仅4分钟，不超过1小时阈值，不应修正
+    expect(commentTime.format('YYYY-MM-DD HH:mm:ss')).toBe('2026-07-11 00:01:00');
+  });
+
+  test('评论时间刚好在当前时间1小时后不触发修正', () => {
+    const now = dayjs.tz('2026-07-11 14:00:00', 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+
+    // 15:00 距当前14:00恰好1小时，isAfter(now+1h) 为 false
+    const commentTime = parseCommentTime('15:00:00', now);
+    expect(commentTime.format('YYYY-MM-DD HH:mm:ss')).toBe('2026-07-11 15:00:00');
   });
 });
 
