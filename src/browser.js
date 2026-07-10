@@ -26,6 +26,68 @@ function nowBeijing() {
   return dayjs().tz(BEIJING_TZ);
 }
 
+// ─── 工具函数 ─────────────────────────────────────────────────────
+
+/**
+ * 判断当前页面是否实际处于登录页
+ * 同时检查 URL 和页面内容，防止 URL 短暂显示目标域名时误判
+ */
+async function isStillLoginPage(page) {
+  try {
+    const url = page.url();
+    // URL 明确在登录域名
+    if (url.includes('login.taobao.com') || url.includes('login.tmall.com')) {
+      return true;
+    }
+    // URL 在 liveplatform 但页面可能还没加载完，检查内容
+    const result = await page.evaluate(() => {
+      const title = document.title || '';
+      const bodyText = document.body ? document.body.innerText.substring(0, 3000) : '';
+      // 登录页特征
+      const hasLoginForm = !!document.querySelector('#fm-login-id, #fm-login-password, [class*="login-form"], [class*="login-box"], #login-form');
+      const hasLoginTitle = title.includes('登录') || title.includes('login') || title.includes('Login');
+      const hasLoginCSS = !!document.querySelector('.login-msg, [class*="havana"], [class*="login-panel"]');
+      const hasLiveContent = bodyText.includes('直播') && !bodyText.includes('登录-淘宝');
+      return { hasLoginForm, hasLoginTitle, hasLoginCSS, hasLiveContent, title };
+    });
+    // 如果有登录表单/标题/CSS，且没有直播内容 → 仍是登录页
+    if (result.hasLoginForm || result.hasLoginTitle || result.hasLoginCSS) {
+      if (!result.hasLiveContent) {
+        return true;
+      }
+    }
+    return false;
+  } catch {
+    // 页面正在导航中，视为登录页
+    return true;
+  }
+}
+
+/**
+ * 等待用户完成登录，使用内容检测而非纯 URL 检测
+ * @returns {boolean} 是否登录成功
+ */
+async function waitForLogin(page, timeoutMs) {
+  const startTime = Date.now();
+  while (Date.now() - startTime < timeoutMs) {
+    await new Promise((r) => setTimeout(r, 3000));
+
+    const stillLogin = await isStillLoginPage(page);
+    if (!stillLogin) {
+      // 不再是登录页 → 再确认一次（防止页面正在重定向中的瞬间误判）
+      console.log('[浏览器] 检测到登录完成，等待页面稳定...');
+      await page.waitForTimeout(5000);
+      const doubleCheck = await isStillLoginPage(page);
+      if (!doubleCheck) {
+        console.log('[浏览器] ✅ 登录成功！');
+        return true;
+      }
+      console.log('[浏览器] 页面又回到登录状态，继续等待...');
+    }
+  }
+  return false;
+}
+
 // ─── 浏览器连接 / 启动 ─────────────────────────────────────────────
 
 /**
@@ -282,40 +344,16 @@ async function launchForLogin() {
   console.log('[浏览器] 导航到淘宝直播中控台...');
   await page.goto(config.taobao.liveListUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-  // 检查是否被重定向到登录页
-  const currentUrl = page.url();
-  if (currentUrl.includes('login')) {
+  // 等待页面加载完成后检查是否需要登录（内容检测）
+  await page.waitForTimeout(5000);
+  const needLogin = await isStillLoginPage(page);
+
+  if (needLogin) {
     console.log('[浏览器] ⏳ 需要登录，请在浏览器中完成登录...');
     console.log('[浏览器] 登录成功后会自动跳转回直播列表页面');
 
-    // 等待用户登录 — 页面必须稳定在非登录 URL 上
-    const startTime = Date.now();
-    let settled = false;
-    while (Date.now() - startTime < timeoutMs) {
-      await new Promise((r) => setTimeout(r, 3000));
-      const url = page.url();
-
-      if (url.includes('liveplatform.taobao.com')) {
-        // URL 到了 liveplatform，再等几秒确认不会弹回 login
-        console.log('[浏览器] 检测到跳转到直播列表，等待页面稳定...');
-        await page.waitForTimeout(5000);
-        const checkUrl = page.url();
-        if (checkUrl.includes('liveplatform.taobao.com')) {
-          console.log('[浏览器] ✅ 登录成功！已稳定在直播列表页面');
-          settled = true;
-          break;
-        } else {
-          console.log('[浏览器] 页面又跳转了，继续等待...');
-        }
-      } else if (!url.includes('login')) {
-        // 跳转到了其他非登录页面（比如淘宝首页）
-        console.log('[浏览器] ✅ 登录成功，已离开登录页');
-        settled = true;
-        break;
-      }
-    }
-
-    if (!settled) {
+    const ok = await waitForLogin(page, timeoutMs);
+    if (!ok) {
       console.error('[浏览器] ❌ 登录超时，请重新运行');
       process.exit(1);
     }
@@ -328,6 +366,11 @@ async function launchForLogin() {
       console.log('[浏览器] 重新导航到直播列表...');
       await page.goto(config.taobao.liveListUrl, { waitUntil: 'networkidle', timeout: 60000 });
       await page.waitForTimeout(5000);
+      // 再次确认
+      if (await isStillLoginPage(page)) {
+        console.error('[浏览器] ❌ 导航后仍在登录页，请重新运行');
+        process.exit(1);
+      }
     }
   } else {
     console.log('[浏览器] ✅ 已有登录态，直接进入直播列表');
@@ -354,41 +397,23 @@ async function enterLiveRoom(page) {
   }
   await page.waitForTimeout(5000); // 等待页面完全渲染
 
-  // 如果被重定向到登录页，等待用户登录
-  if (page.url().includes('login')) {
+  // 如果被重定向到登录页，等待用户登录（内容检测）
+  if (await isStillLoginPage(page)) {
     console.log('[浏览器] ⏳ 页面需要登录，请在浏览器中完成登录...');
     const timeoutMs = config.browser.loginTimeoutSeconds * 1000;
-    const startTime = Date.now();
-    let settled = false;
-    while (Date.now() - startTime < timeoutMs) {
-      await new Promise(r => setTimeout(r, 3000));
-      const url = page.url();
+    const ok = await waitForLogin(page, timeoutMs);
 
-      if (url.includes('liveplatform.taobao.com')) {
-        // URL 到了 liveplatform，再等几秒确认不会弹回 login
-        console.log('[浏览器] 检测到跳转到直播列表，等待稳定...');
-        await page.waitForTimeout(5000);
-        if (page.url().includes('liveplatform.taobao.com')) {
-          console.log('[浏览器] ✅ 登录成功，已稳定在直播列表');
-          settled = true;
-          break;
-        } else {
-          console.log('[浏览器] 页面又跳转了，继续等待...');
-        }
-      } else if (!url.includes('login')) {
-        // 登录后跳转到其他页面
-        console.log('[浏览器] ✅ 登录成功，重新导航到直播列表...');
-        await page.goto(config.taobao.liveListUrl, { waitUntil: 'networkidle', timeout: 60000 });
-        await page.waitForTimeout(5000);
-        settled = true;
-        break;
-      }
-    }
-
-    if (!settled) {
+    if (!ok) {
       console.error('[浏览器] ❌ 登录超时');
+      return false;
     }
-    await page.waitForTimeout(3000);
+
+    // 确保在直播列表页
+    if (!page.url().includes('liveplatform.taobao.com')) {
+      console.log('[浏览器] 重新导航到直播列表...');
+      await page.goto(config.taobao.liveListUrl, { waitUntil: 'networkidle', timeout: 60000 });
+      await page.waitForTimeout(5000);
+    }
   }
 
   console.log('[浏览器] 当前页面:', page.url());
