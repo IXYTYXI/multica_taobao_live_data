@@ -48,6 +48,14 @@ const config = {
   monitor: {
     intervalSeconds: parseInt(process.env.MONITOR_INTERVAL || '10', 10),
     commentCheckMinutes: parseInt(process.env.COMMENT_CHECK_MINUTES || '5', 10),
+
+    /**
+     * 跨午夜日界线偏移（分钟），默认 5
+     * 表示一天的分界点是 00:05 而非 00:00。
+     * 例如 DAY_BOUNDARY_MINUTES=5 时，7/12 00:05 ~ 7/13 00:05 算作 7/12 的直播。
+     * 当评论时间被拼到"今天"后超过 now + 该值，自动回退到前一天日期。
+     */
+    dayBoundaryMinutes: parseInt(process.env.DAY_BOUNDARY_MINUTES || '5', 10),
   },
 };
 

@@ -582,9 +582,13 @@ async function getRecentComments(page, withinMinutes) {
         let fullTimeStr = `${today} ${timeStr}`;
         let commentTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
 
-        // 跨午夜修正：如果拼出的时间比当前时间晚超过1小时，
-        // 说明评论实际来自前一天（如当前00:02, 评论23:58 → 拼成今天23:58是未来）
-        if (commentTime.isAfter(now.add(1, 'hour'))) {
+        // 跨午夜修正（可配置日界线）：
+        // DAY_BOUNDARY_MINUTES（默认5）定义一天的分界点，
+        // 即 00:05 之前仍算作前一天的直播。
+        // 如果拼出的评论时间超过 now + dayBoundaryMinutes，
+        // 说明评论实际来自前一天。
+        const boundaryMinutes = config.monitor.dayBoundaryMinutes || 5;
+        if (commentTime.isAfter(now.add(boundaryMinutes, 'minute'))) {
           const yesterday = now.subtract(1, 'day').format('YYYY-MM-DD');
           fullTimeStr = `${yesterday} ${timeStr}`;
           commentTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);

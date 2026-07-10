@@ -12,20 +12,22 @@ dayjs.extend(timezone);
 
 const BEIJING_TZ = 'Asia/Shanghai';
 
-describe('跨午夜评论时间边界', () => {
+describe('跨午夜评论时间边界（可配置日界线）', () => {
   /**
-   * 跨午夜修正逻辑：如果拼出的时间比当前时间晚超过1小时，
-   * 说明评论实际来自前一天，应减去1天。
+   * 跨午夜修正逻辑：DAY_BOUNDARY_MINUTES（默认5）定义日界线偏移。
+   * 如果拼出的时间超过 now + dayBoundaryMinutes 分钟，说明评论来自前一天。
+   * 例如 boundaryMinutes=5 → 7/12 00:05 ~ 7/13 00:05 算作 7/12。
    */
 
   // 复现 browser.js getRecentComments 中的跨午夜修正逻辑
-  function parseCommentTime(commentTimeStr, nowTime) {
+  function parseCommentTime(commentTimeStr, nowTime, boundaryMinutes) {
+    if (boundaryMinutes === undefined) boundaryMinutes = 5;
     const today = nowTime.format('YYYY-MM-DD');
     let fullTimeStr = `${today} ${commentTimeStr}`;
     let commentTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
 
     // 跨午夜修正
-    if (commentTime.isAfter(nowTime.add(1, 'hour'))) {
+    if (commentTime.isAfter(nowTime.add(boundaryMinutes, 'minute'))) {
       const yesterday = nowTime.subtract(1, 'day').format('YYYY-MM-DD');
       fullTimeStr = `${yesterday} ${commentTimeStr}`;
       commentTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
@@ -34,54 +36,67 @@ describe('跨午夜评论时间边界', () => {
     return commentTime;
   }
 
-  test('午夜后正确将前一天的评论时间解析到昨天日期', () => {
-    // 当前北京时间是 2026-07-11 00:02:00
+  test('默认5分钟日界线：00:02时23:58评论回退到昨天', () => {
     const now = dayjs.tz('2026-07-11 00:02:00', 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
     const cutoff = now.subtract(5, 'minute');
 
-    // 评论显示时间 23:58（实际是前一天 07-10 的）
-    const commentTime = parseCommentTime('23:58:00', now);
+    const commentTime = parseCommentTime('23:58:00', now, 5);
 
     // 修正后应被解析为 2026-07-10 23:58:00
     expect(commentTime.format('YYYY-MM-DD HH:mm:ss')).toBe('2026-07-10 23:58:00');
-    // 在 cutoff (2026-07-10 23:57:00) 之后，应被采集
     expect(commentTime.isAfter(cutoff)).toBe(true);
   });
 
-  test('午夜后正确将23:55评论解析到前一天', () => {
+  test('默认5分钟日界线：00:02时23:55评论回退到昨天', () => {
     const now = dayjs.tz('2026-07-11 00:02:00', 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
 
-    const commentTime = parseCommentTime('23:55:00', now);
+    const commentTime = parseCommentTime('23:55:00', now, 5);
 
-    // 修正后应为前一天 07-10 23:55:00，而非未来时间
     expect(commentTime.format('YYYY-MM-DD HH:mm:ss')).toBe('2026-07-10 23:55:00');
-    expect(commentTime.isBefore(now)).toBe(true); // 不再是未来时间
+    expect(commentTime.isBefore(now)).toBe(true);
+  });
+
+  test('00:03时00:01评论不回退（在日界线窗口内）', () => {
+    const now = dayjs.tz('2026-07-11 00:03:00', 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+
+    const commentTime = parseCommentTime('00:01:00', now, 5);
+
+    // 00:01 在 now+5min=00:08 之前，不触发修正
+    expect(commentTime.format('YYYY-MM-DD HH:mm:ss')).toBe('2026-07-11 00:01:00');
   });
 
   test('非跨午夜场景不受影响：当天14:30评论正常解析', () => {
     const now = dayjs.tz('2026-07-11 15:00:00', 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
 
-    const commentTime = parseCommentTime('14:30:00', now);
+    const commentTime = parseCommentTime('14:30:00', now, 5);
 
-    // 不触发修正，仍为当天日期
     expect(commentTime.format('YYYY-MM-DD HH:mm:ss')).toBe('2026-07-11 14:30:00');
   });
 
-  test('刚过午夜时当天00:01评论不被误修正到昨天', () => {
+  test('自定义日界线10分钟：00:05时23:58评论回退到昨天', () => {
     const now = dayjs.tz('2026-07-11 00:05:00', 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
 
-    const commentTime = parseCommentTime('00:01:00', now);
+    const commentTime = parseCommentTime('23:58:00', now, 10);
 
-    // 00:01 距当前00:05仅4分钟，不超过1小时阈值，不应修正
-    expect(commentTime.format('YYYY-MM-DD HH:mm:ss')).toBe('2026-07-11 00:01:00');
+    // 23:58 > 00:05+10min=00:15，所以回退
+    expect(commentTime.format('YYYY-MM-DD HH:mm:ss')).toBe('2026-07-10 23:58:00');
   });
 
-  test('评论时间刚好在当前时间1小时后不触发修正', () => {
+  test('自定义日界线10分钟：00:05时00:08评论不回退', () => {
+    const now = dayjs.tz('2026-07-11 00:05:00', 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+
+    const commentTime = parseCommentTime('00:08:00', now, 10);
+
+    // 00:08 < 00:05+10min=00:15，不触发修正
+    expect(commentTime.format('YYYY-MM-DD HH:mm:ss')).toBe('2026-07-11 00:08:00');
+  });
+
+  test('评论时间刚好在日界线边界不触发修正', () => {
     const now = dayjs.tz('2026-07-11 14:00:00', 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
 
-    // 15:00 距当前14:00恰好1小时，isAfter(now+1h) 为 false
-    const commentTime = parseCommentTime('15:00:00', now);
-    expect(commentTime.format('YYYY-MM-DD HH:mm:ss')).toBe('2026-07-11 15:00:00');
+    // 14:05 = now+5min，isAfter(now+5) 为 false
+    const commentTime = parseCommentTime('14:05:00', now, 5);
+    expect(commentTime.format('YYYY-MM-DD HH:mm:ss')).toBe('2026-07-11 14:05:00');
   });
 });
 

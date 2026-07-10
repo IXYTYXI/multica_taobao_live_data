@@ -70,6 +70,18 @@ describe('config.js', () => {
     expect(config.monitor.commentCheckMinutes).toBe(10);
   });
 
+  test('日界线偏移默认 5 分钟', () => {
+    delete process.env.DAY_BOUNDARY_MINUTES;
+    const config = require('../src/config');
+    expect(config.monitor.dayBoundaryMinutes).toBe(5);
+  });
+
+  test('日界线偏移自定义值', () => {
+    process.env.DAY_BOUNDARY_MINUTES = '10';
+    const config = require('../src/config');
+    expect(config.monitor.dayBoundaryMinutes).toBe(10);
+  });
+
   test('CDP 调试端口默认 9222', () => {
     delete process.env.CHROME_DEBUG_PORT;
     const config = require('../src/config');
