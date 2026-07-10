@@ -2,6 +2,7 @@
  * 配置管理模块
  * 从环境变量加载所有配置项
  */
+const path = require('path');
 require('dotenv').config();
 
 const config = {
@@ -13,9 +14,29 @@ const config = {
     tableId: process.env.FEISHU_TABLE_ID || 'tbluFzEQv1KRMsiG',
   },
 
-  // Chrome 调试配置
-  chrome: {
+  // 浏览器配置
+  browser: {
+    /**
+     * 浏览器启动模式:
+     *   "cdp"     — 连接已开启调试端口的 Chrome（需 --remote-debugging-port）
+     *   "profile" — 复制本机 Chrome 的用户数据目录来继承登录态（推荐）
+     *   "login"   — 打开全新浏览器，等待用户手动登录后继续
+     */
+    mode: (process.env.BROWSER_MODE || 'profile').toLowerCase(),
+
+    // CDP 模式的调试端口
     debugPort: parseInt(process.env.CHROME_DEBUG_PORT || '9222', 10),
+
+    // profile 模式: 本机 Chrome 用户数据目录
+    // Windows 默认: C:\Users\<用户名>\AppData\Local\Google\Chrome\User Data
+    // macOS 默认:   ~/Library/Application Support/Google/Chrome
+    chromeUserDataDir: process.env.CHROME_USER_DATA_DIR || '',
+
+    // 本工具自己的持久化浏览器数据目录（login 模式用）
+    localDataDir: process.env.LOCAL_BROWSER_DATA_DIR || path.resolve(__dirname, '..', 'chrome-data'),
+
+    // login 模式: 等待登录的超时时间（秒）
+    loginTimeoutSeconds: parseInt(process.env.LOGIN_TIMEOUT || '300', 10),
   },
 
   // 淘宝直播中控台

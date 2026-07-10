@@ -1,6 +1,6 @@
 # 淘宝直播数据采集工具
 
-使用 Playwright（Node.js）连接本地已登录的 Chrome 浏览器（有头模式），自动化操作淘宝直播中控台，采集评论和订单数据并写入飞书多维表格。
+使用 Playwright（Node.js）自动化操作淘宝直播中控台，采集评论和订单数据并写入飞书多维表格。
 
 ## 功能
 
@@ -13,24 +13,58 @@
 ## 前置条件
 
 1. **Node.js** ≥ 18.0.0
-2. **Chrome 浏览器**以远程调试模式启动：
-   ```bash
-   # Windows
-   chrome.exe --remote-debugging-port=9222
-
-   # macOS
-   /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
-
-   # Linux
-   google-chrome --remote-debugging-port=9222
-   ```
-3. 在 Chrome 中**已登录淘宝直播中控台**
-4. 飞书应用已授权访问目标多维表格
+2. 本机已安装 **Chrome 浏览器**
+3. 飞书应用已授权访问目标多维表格
 
 ## 安装
 
 ```bash
 npm install
+```
+
+## 浏览器模式
+
+通过 `.env` 中的 `BROWSER_MODE` 选择（默认 `profile`）：
+
+### 方式一：`profile` — 继承本机 Chrome 登录态（推荐）
+
+直接复制你 Chrome 的 cookie 到工具自己的目录，无需重新登录，也不需要关闭正在使用的 Chrome。
+
+```bash
+# .env
+BROWSER_MODE=profile
+# Chrome 用户数据目录（留空则自动检测）
+CHROME_USER_DATA_DIR=
+```
+
+Windows 默认路径: `C:\Users\<用户名>\AppData\Local\Google\Chrome\User Data`
+macOS 默认路径: `~/Library/Application Support/Google/Chrome`
+
+### 方式二：`login` — 打开浏览器手动登录
+
+工具会打开一个浏览器窗口，跳转到淘宝登录页。你在浏览器中完成登录后，工具自动检测到登录成功并继续运行。登录态会保存在本地 `chrome-data/` 目录，下次可切回 `profile` 模式免登录。
+
+```bash
+# .env
+BROWSER_MODE=login
+```
+
+### 方式三：`cdp` — 连接已开启调试端口的 Chrome
+
+需要先以调试端口启动 Chrome（适合已经熟悉这种方式的用户）：
+
+```bash
+# Windows
+chrome.exe --remote-debugging-port=9222
+
+# macOS
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
+```
+
+```bash
+# .env
+BROWSER_MODE=cdp
+CHROME_DEBUG_PORT=9222
 ```
 
 ## 配置
@@ -41,15 +75,16 @@ npm install
 cp .env.example .env
 ```
 
-配置项说明：
-
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `FEISHU_APP_ID` | 飞书应用 App ID | — |
 | `FEISHU_APP_SECRET` | 飞书应用 App Secret | — |
 | `FEISHU_BASE_APP_TOKEN` | 多维表格 App Token | `D6JAbvNKZaUgMGsTfkPcgXn2nBd` |
 | `FEISHU_TABLE_ID` | 数据表 ID | `tbluFzEQv1KRMsiG` |
-| `CHROME_DEBUG_PORT` | Chrome 调试端口 | `9222` |
+| `BROWSER_MODE` | 浏览器模式 | `profile` |
+| `CHROME_USER_DATA_DIR` | Chrome 用户数据目录 | 自动检测 |
+| `CHROME_DEBUG_PORT` | Chrome 调试端口（cdp 模式） | `9222` |
+| `LOGIN_TIMEOUT` | 手动登录超时（秒，login 模式） | `300` |
 | `MONITOR_INTERVAL` | 监控间隔（秒） | `10` |
 | `COMMENT_CHECK_MINUTES` | 评论检查范围（分钟） | `5` |
 
@@ -61,15 +96,15 @@ npm start
 
 ## 飞书多维表格字段
 
-目标表格应包含以下字段：
+目标表格包含以下字段：
 
 | 字段名 | 类型 | 说明 |
 |--------|------|------|
-| 评论者ID | 文本 | 评论者的淘宝用户ID |
+| 用户ID | 文本 | 评论者的淘宝用户ID |
 | 评论时间 | 文本 | 评论时间（北京时间，格式 YYYY-MM-DD HH:mm:ss） |
-| 评论内容 | 文本 | 评论文字内容 |
+| 用户评论 | 文本 | 评论文字内容 |
 | 订单编号 | 文本 | 淘宝订单号 |
-| 下单时间 | 文本 | 支付时间（北京时间） |
+| 支付时间 | 日期 | 支付时间（毫秒时间戳） |
 
 ## 时区说明
 
@@ -81,22 +116,6 @@ npm start
 src/
 ├── index.js      # 主入口 — 监控循环和编排
 ├── config.js     # 配置管理（从 .env 加载）
-├── browser.js    # 浏览器自动化（Playwright）
+├── browser.js    # 浏览器自动化（三种模式 + 页面操作）
 └── feishu.js     # 飞书 API（多维表格写入）
-```
-
-## 工作原理
-
-```
-┌─────────────┐     ┌────────────────┐     ┌───────────┐
-│  Chrome      │────>│  Playwright    │────>│  飞书 API  │
-│  (已登录)    │     │  自动化控制     │     │  写入表格  │
-└─────────────┘     └────────────────┘     └───────────┘
-       │                    │
-       │    ┌───────────────┘
-       │    │
-       v    v
-  淘宝直播中控台
-  ├── 实时表现 → 成交人数监控
-  └── 直播互动 → 评论采集 + 订单查看
 ```

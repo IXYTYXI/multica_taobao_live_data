@@ -1,8 +1,14 @@
 /**
  * 浏览器自动化模块
- * 使用 Playwright 连接本地已登录的 Chrome 进行淘宝直播数据采集
+ * 支持三种方式连接/启动 Chrome：
+ *   1. cdp     — 连接已开启调试端口的 Chrome
+ *   2. profile — 使用本机 Chrome 用户数据目录（继承登录态 cookie）
+ *   3. login   — 打开全新浏览器，等待用户手动登录
  */
 const { chromium } = require('playwright');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 const dayjs = require('dayjs');
 const utc = require('dayjs/plugin/utc');
 const timezone = require('dayjs/plugin/timezone');
@@ -11,47 +17,260 @@ const config = require('./config');
 dayjs.extend(utc);
 dayjs.extend(timezone);
 
-// 北京时区
 const BEIJING_TZ = 'Asia/Shanghai';
 
 /**
- * 获取北京时间的当前时间
+ * 获取北京时间
  */
 function nowBeijing() {
   return dayjs().tz(BEIJING_TZ);
 }
 
-/**
- * 连接到本地已登录的 Chrome 浏览器
- * 需要以 --remote-debugging-port=9222 启动 Chrome
- */
-async function connectBrowser() {
-  const debugUrl = `http://127.0.0.1:${config.chrome.debugPort}`;
-  console.log(`[浏览器] 正在连接 Chrome (${debugUrl}) ...`);
+// ─── 浏览器连接 / 启动 ─────────────────────────────────────────────
 
-  const browser = await chromium.connectOverCDP(debugUrl);
-  console.log('[浏览器] 连接成功');
-  return browser;
+/**
+ * 猜测本机 Chrome 用户数据目录
+ */
+function guessChromePath() {
+  const platform = os.platform();
+  const home = os.homedir();
+
+  if (platform === 'win32') {
+    return path.join(home, 'AppData', 'Local', 'Google', 'Chrome', 'User Data');
+  } else if (platform === 'darwin') {
+    return path.join(home, 'Library', 'Application Support', 'Google', 'Chrome');
+  } else {
+    return path.join(home, '.config', 'google-chrome');
+  }
 }
 
 /**
- * 导航到直播列表页面并找到正在直播的场次
- * @param {import('playwright').Page} page
- * @returns {Promise<boolean>} 是否成功进入中控台
+ * 启动浏览器 — 根据 config.browser.mode 选择策略
+ * @returns {{ browser: import('playwright').Browser, context: import('playwright').BrowserContext, page: import('playwright').Page }}
+ */
+async function launchBrowser() {
+  const mode = config.browser.mode;
+  console.log(`[浏览器] 启动模式: ${mode}`);
+
+  if (mode === 'cdp') {
+    return await launchCDP();
+  } else if (mode === 'profile') {
+    return await launchWithProfile();
+  } else if (mode === 'login') {
+    return await launchForLogin();
+  } else {
+    console.log(`[浏览器] 未知模式 "${mode}"，回退到 profile 模式`);
+    return await launchWithProfile();
+  }
+}
+
+/**
+ * 模式 1: CDP — 连接已开启调试端口的 Chrome
+ */
+async function launchCDP() {
+  const debugUrl = `http://127.0.0.1:${config.browser.debugPort}`;
+  console.log(`[浏览器] 正在通过 CDP 连接 Chrome (${debugUrl}) ...`);
+
+  const browser = await chromium.connectOverCDP(debugUrl);
+  const contexts = browser.contexts();
+  if (contexts.length === 0) {
+    throw new Error('CDP 连接成功但没有可用的浏览器上下文');
+  }
+  const context = contexts[0];
+  const pages = context.pages();
+  const page = pages.length > 0 ? pages[0] : await context.newPage();
+
+  console.log('[浏览器] CDP 连接成功');
+  return { browser, context, page };
+}
+
+/**
+ * 模式 2: profile — 使用本机 Chrome 用户数据目录（继承 cookie）
+ *
+ * Playwright 的 launchPersistentContext 会锁定 userDataDir，
+ * 所以如果 Chrome 正在运行则无法直接用原目录。
+ * 解决方法：将用户目录里的关键 cookie/storage 文件复制到工具自己的目录下。
+ */
+async function launchWithProfile() {
+  let chromeUserDataDir = config.browser.chromeUserDataDir || guessChromePath();
+  const localDataDir = config.browser.localDataDir;
+
+  console.log(`[浏览器] Chrome 用户数据目录: ${chromeUserDataDir}`);
+  console.log(`[浏览器] 本工具数据目录: ${localDataDir}`);
+
+  // 确保本工具数据目录存在
+  if (!fs.existsSync(localDataDir)) {
+    fs.mkdirSync(localDataDir, { recursive: true });
+  }
+
+  // 把 Chrome 的 cookie / Local State 复制过来以继承登录态
+  copyChromeState(chromeUserDataDir, localDataDir);
+
+  console.log('[浏览器] 使用复制的 Chrome profile 启动（有头模式）...');
+  const context = await chromium.launchPersistentContext(localDataDir, {
+    headless: false,
+    channel: 'chrome', // 使用系统安装的 Chrome（而非 bundled Chromium）
+    args: [
+      '--disable-blink-features=AutomationControlled',
+      '--no-first-run',
+      '--no-default-browser-check',
+    ],
+    ignoreDefaultArgs: ['--enable-automation'],
+    viewport: null, // 使用系统窗口大小
+  });
+
+  const pages = context.pages();
+  const page = pages.length > 0 ? pages[0] : await context.newPage();
+
+  console.log('[浏览器] 启动成功，已继承 Chrome 登录态');
+  return { browser: null, context, page };
+}
+
+/**
+ * 从 Chrome 用户目录复制关键文件到工具目录
+ */
+function copyChromeState(src, dest) {
+  const defaultProfile = path.join(src, 'Default');
+  const destDefault = path.join(dest, 'Default');
+
+  if (!fs.existsSync(defaultProfile)) {
+    console.log(`[浏览器] 未找到 Chrome Default profile: ${defaultProfile}`);
+    return;
+  }
+
+  if (!fs.existsSync(destDefault)) {
+    fs.mkdirSync(destDefault, { recursive: true });
+  }
+
+  // 需要复制的文件（cookie + storage + login state）
+  const filesToCopy = [
+    'Cookies',
+    'Cookies-journal',
+    'Login Data',
+    'Login Data-journal',
+    'Web Data',
+    'Web Data-journal',
+    'Preferences',
+    'Secure Preferences',
+  ];
+
+  // 顶层文件
+  const topFiles = ['Local State'];
+
+  for (const file of filesToCopy) {
+    const srcFile = path.join(defaultProfile, file);
+    const destFile = path.join(destDefault, file);
+    if (fs.existsSync(srcFile)) {
+      try {
+        fs.copyFileSync(srcFile, destFile);
+      } catch (e) {
+        // Chrome 正在使用文件时可能 EPERM，可以忽略
+        console.log(`[浏览器] 复制 ${file} 失败（Chrome 可能正在使用）: ${e.message}`);
+      }
+    }
+  }
+
+  for (const file of topFiles) {
+    const srcFile = path.join(src, file);
+    const destFile = path.join(dest, file);
+    if (fs.existsSync(srcFile)) {
+      try {
+        fs.copyFileSync(srcFile, destFile);
+      } catch (e) {
+        console.log(`[浏览器] 复制 ${file} 失败: ${e.message}`);
+      }
+    }
+  }
+
+  console.log('[浏览器] Chrome 登录态文件已复制');
+}
+
+/**
+ * 模式 3: login — 打开全新浏览器，等待用户手动登录
+ */
+async function launchForLogin() {
+  const localDataDir = config.browser.localDataDir;
+  const timeoutMs = config.browser.loginTimeoutSeconds * 1000;
+
+  if (!fs.existsSync(localDataDir)) {
+    fs.mkdirSync(localDataDir, { recursive: true });
+  }
+
+  console.log('[浏览器] 打开浏览器等待手动登录...');
+  console.log('[浏览器] 请在弹出的浏览器中完成淘宝登录');
+  console.log(`[浏览器] 登录超时: ${config.browser.loginTimeoutSeconds} 秒`);
+
+  const context = await chromium.launchPersistentContext(localDataDir, {
+    headless: false,
+    channel: 'chrome',
+    args: [
+      '--disable-blink-features=AutomationControlled',
+      '--no-first-run',
+      '--no-default-browser-check',
+    ],
+    ignoreDefaultArgs: ['--enable-automation'],
+    viewport: null,
+  });
+
+  const pages = context.pages();
+  const page = pages.length > 0 ? pages[0] : await context.newPage();
+
+  // 导航到淘宝登录页
+  await page.goto('https://login.taobao.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+  console.log('[浏览器] ⏳ 请在浏览器中完成登录，登录成功后会自动继续...');
+
+  // 等待用户登录 — 检测页面跳转到非登录页或检测到登录 cookie
+  const startTime = Date.now();
+  while (Date.now() - startTime < timeoutMs) {
+    const url = page.url();
+    // 登录成功后通常会跳转到首页或 redirect 目标
+    if (
+      !url.includes('login.taobao.com') &&
+      !url.includes('login.tmall.com') &&
+      !url.includes('about:blank')
+    ) {
+      console.log('[浏览器] ✅ 检测到登录成功!');
+      break;
+    }
+
+    // 也可以检查 cookie
+    const cookies = await context.cookies('https://taobao.com');
+    const hasLoginCookie = cookies.some(
+      (c) => c.name === 'login' || c.name === '_tb_token_' || c.name === 'munb'
+    );
+    if (hasLoginCookie) {
+      console.log('[浏览器] ✅ 检测到登录 cookie!');
+      break;
+    }
+
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+
+  if (Date.now() - startTime >= timeoutMs) {
+    console.error('[浏览器] ❌ 登录超时，请重新运行');
+    process.exit(1);
+  }
+
+  // 登录成功后 cookie 已保存在 localDataDir 中，下次可用 profile 模式跳过登录
+  console.log('[浏览器] 登录态已保存，下次可使用 BROWSER_MODE=profile 跳过登录');
+  return { browser: null, context, page };
+}
+
+// ─── 页面操作 ───────────────────────────────────────────────────────
+
+/**
+ * 导航到直播列表并进入正在直播的场次
  */
 async function enterLiveRoom(page) {
   console.log('[浏览器] 导航到直播列表页面...');
   await page.goto(config.taobao.liveListUrl, { waitUntil: 'networkidle', timeout: 30000 });
   await page.waitForTimeout(3000);
 
-  // 在直播计划列表中查找状态为"直播中"的场次
   console.log('[浏览器] 查找正在直播的场次...');
 
-  // 尝试多种选择器定位"直播中"状态的场次
   const liveStatusSelectors = [
-    // 包含"直播中"文字的元素
     'text=直播中',
-    // 常见的状态标签
     '.live-status:has-text("直播中")',
     '[class*="status"]:has-text("直播中")',
     '[class*="live"]:has-text("直播中")',
@@ -72,19 +291,16 @@ async function enterLiveRoom(page) {
   }
 
   if (!foundLive) {
-    console.log('[浏览器] 未找到正在直播的场次，尝试查找页面上所有可能的入口...');
-    // 打印页面内容帮助调试
+    console.log('[浏览器] 未找到正在直播的场次，尝试查找页面入口...');
     const bodyText = await page.textContent('body');
     console.log('[浏览器] 页面文本摘要:', bodyText?.substring(0, 500));
   }
 
-  // 查找并点击"直播详情"按钮
   const detailSelectors = [
     'text=直播详情',
     'a:has-text("直播详情")',
     'button:has-text("直播详情")',
     '[class*="detail"]:has-text("直播详情")',
-    // 直播中场次所在行的操作按钮
     'tr:has-text("直播中") a:has-text("详情")',
     'tr:has-text("直播中") button:has-text("详情")',
     '.list-item:has-text("直播中") a',
@@ -106,7 +322,6 @@ async function enterLiveRoom(page) {
     }
   }
 
-  // 如果上面的方式都失败，尝试获取页面中所有链接
   console.log('[浏览器] 标准选择器未命中，扫描页面链接...');
   const links = await page.$$eval('a', (anchors) =>
     anchors.map((a) => ({ href: a.href, text: a.textContent?.trim() }))
@@ -129,13 +344,10 @@ async function enterLiveRoom(page) {
 }
 
 /**
- * 获取中控台"实时表现"区域的成交人数
- * @param {import('playwright').Page} page
- * @returns {Promise<number|null>} 成交人数
+ * 获取成交人数
  */
 async function getTransactionCount(page) {
   const selectors = [
-    // 尝试多种可能的选择器
     '[class*="transaction"] [class*="num"]',
     '[class*="deal"] [class*="num"]',
     '[class*="trade"] [class*="count"]',
@@ -155,7 +367,6 @@ async function getTransactionCount(page) {
     }
   }
 
-  // 通用方式：查找包含"成交人数"的文本附近的数字
   try {
     const allText = await page.$$eval('*', (els) =>
       els.map((el) => ({
@@ -167,7 +378,6 @@ async function getTransactionCount(page) {
 
     for (const item of allText) {
       if (item.text && item.text.includes('成交人数')) {
-        // 提取相邻的数字
         const match = item.text.match(/成交人数[^\d]*(\d+)/);
         if (match) {
           return parseInt(match[1], 10);
@@ -182,10 +392,7 @@ async function getTransactionCount(page) {
 }
 
 /**
- * 获取直播互动区域的评论列表
- * @param {import('playwright').Page} page
- * @param {number} withinMinutes - 检查最近N分钟的评论
- * @returns {Promise<Array<{nickname: string, userId: string, time: string, content: string}>>}
+ * 获取近期评论
  */
 async function getRecentComments(page, withinMinutes) {
   const cutoff = nowBeijing().subtract(withinMinutes, 'minute');
@@ -193,7 +400,6 @@ async function getRecentComments(page, withinMinutes) {
 
   const comments = [];
 
-  // 先尝试切换到"全部"评论 tab
   try {
     const allTab = await page.$('text=全部');
     if (allTab) {
@@ -204,67 +410,35 @@ async function getRecentComments(page, withinMinutes) {
     // 忽略
   }
 
-  // 尝试获取评论列表
-  // 淘宝直播评论格式: 用户昵称(ID) 时间 + 评论内容
   try {
     const commentElements = await page.$$('[class*="comment"], [class*="message"], [class*="chat"], [class*="interact"]');
 
-    if (commentElements.length === 0) {
-      // 更宽泛的选择
-      const listItems = await page.$$('li, [class*="item"]');
-      for (const item of listItems) {
-        const text = await item.textContent();
-        if (!text) continue;
+    const elements = commentElements.length > 0
+      ? commentElements
+      : await page.$$('li, [class*="item"]');
 
-        // 匹配评论格式: 昵称(ID) HH:mm:ss 评论内容
-        // 或: 昵称 HH:mm 评论内容
-        const commentMatch = text.match(
-          /([^\s(]+)(?:\(([^)]+)\))?\s+(\d{1,2}:\d{2}(?::\d{2})?)\s+(.+)/
-        );
+    for (const el of elements) {
+      const text = await el.textContent();
+      if (!text) continue;
 
-        if (commentMatch) {
-          const [, nickname, userId, timeStr, content] = commentMatch;
+      const commentMatch = text.match(
+        /([^\s(]+)(?:\(([^)]+)\))?\s+(\d{1,2}:\d{2}(?::\d{2})?)\s+(.+)/
+      );
 
-          // 解析时间，假设是当天北京时间
-          const today = nowBeijing().format('YYYY-MM-DD');
-          const fullTimeStr = `${today} ${timeStr}`;
-          const commentTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+      if (commentMatch) {
+        const [, nickname, userId, timeStr, content] = commentMatch;
+        const today = nowBeijing().format('YYYY-MM-DD');
+        const fullTimeStr = `${today} ${timeStr}`;
+        const commentTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
 
-          if (commentTime.isAfter(cutoff)) {
-            comments.push({
-              nickname: nickname?.trim() || '',
-              userId: userId?.trim() || nickname?.trim() || '',
-              time: commentTime.format('YYYY-MM-DD HH:mm:ss'),
-              content: content?.trim() || '',
-              element: item,
-            });
-          }
-        }
-      }
-    } else {
-      for (const el of commentElements) {
-        const text = await el.textContent();
-        if (!text) continue;
-
-        const commentMatch = text.match(
-          /([^\s(]+)(?:\(([^)]+)\))?\s+(\d{1,2}:\d{2}(?::\d{2})?)\s+(.+)/
-        );
-
-        if (commentMatch) {
-          const [, nickname, userId, timeStr, content] = commentMatch;
-          const today = nowBeijing().format('YYYY-MM-DD');
-          const fullTimeStr = `${today} ${timeStr}`;
-          const commentTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
-
-          if (commentTime.isAfter(cutoff)) {
-            comments.push({
-              nickname: nickname?.trim() || '',
-              userId: userId?.trim() || nickname?.trim() || '',
-              time: commentTime.format('YYYY-MM-DD HH:mm:ss'),
-              content: content?.trim() || '',
-              element: el,
-            });
-          }
+        if (commentTime.isAfter(cutoff)) {
+          comments.push({
+            nickname: nickname?.trim() || '',
+            userId: userId?.trim() || nickname?.trim() || '',
+            time: commentTime.format('YYYY-MM-DD HH:mm:ss'),
+            content: content?.trim() || '',
+            element: el,
+          });
         }
       }
     }
@@ -277,15 +451,10 @@ async function getRecentComments(page, withinMinutes) {
 }
 
 /**
- * 点击评论区底部的"查看订单"图标，获取订单信息
- * @param {import('playwright').Page} page
- * @param {Object} comment - 评论对象 (需要含 element 属性来定位)
- * @returns {Promise<{orderNumber: string, paymentTime: string}|null>}
+ * 查看订单信息
  */
 async function getOrderInfo(page, comment) {
   try {
-    // 定位评论区底部的操作图标区域
-    // "查看订单"按钮通常是一个剪贴板样式的图标
     const orderIconSelectors = [
       '[class*="order"] svg',
       '[class*="order"] i',
@@ -297,11 +466,11 @@ async function getOrderInfo(page, comment) {
       '[class*="icon"]:near(:text("订单"))',
     ];
 
-    // 先尝试在评论元素附近找订单图标
     if (comment.element) {
       try {
-        // 评论区底部图标
-        const parent = await comment.element.evaluateHandle((el) => el.closest('[class*="interact"], [class*="chat"], [class*="comment-area"]'));
+        const parent = await comment.element.evaluateHandle((el) =>
+          el.closest('[class*="interact"], [class*="chat"], [class*="comment-area"]')
+        );
         if (parent) {
           for (const sel of orderIconSelectors) {
             const icon = await parent.$(sel);
@@ -317,7 +486,6 @@ async function getOrderInfo(page, comment) {
       }
     }
 
-    // 全局搜索"查看订单"入口
     for (const sel of orderIconSelectors) {
       try {
         const icon = await page.$(sel);
@@ -331,7 +499,6 @@ async function getOrderInfo(page, comment) {
       }
     }
 
-    // 尝试查找底部图标栏
     try {
       const bottomIcons = await page.$$('[class*="toolbar"] svg, [class*="toolbar"] i, [class*="bottom"] svg, [class*="bottom"] i');
       for (const icon of bottomIcons) {
@@ -357,13 +524,10 @@ async function getOrderInfo(page, comment) {
 }
 
 /**
- * 从弹出的订单窗口中提取订单信息
- * @param {import('playwright').Page} page
- * @returns {Promise<{orderNumber: string, paymentTime: string}|null>}
+ * 从弹窗提取订单信息
  */
 async function extractOrderFromPopup(page) {
   try {
-    // 等待弹窗出现
     const dialogSelectors = [
       '[class*="modal"]',
       '[class*="dialog"]',
@@ -384,24 +548,19 @@ async function extractOrderFromPopup(page) {
     }
 
     const dialogText = await dialog.textContent();
-    if (!dialogText) {
-      return null;
-    }
+    if (!dialogText) return null;
 
-    // 提取订单编号
     let orderNumber = '';
     const orderMatch = dialogText.match(/订单[号编]?\s*[：:]\s*(\d+)/);
     if (orderMatch) {
       orderNumber = orderMatch[1];
     } else {
-      // 尝试匹配长数字串（淘宝订单号通常是18-20位数字）
       const longNumMatch = dialogText.match(/\b(\d{15,20})\b/);
       if (longNumMatch) {
         orderNumber = longNumMatch[1];
       }
     }
 
-    // 提取支付时间
     let paymentTime = '';
     const timeMatch = dialogText.match(
       /(?:支付|付款|下单|创建)[时日]?\s*[间期]?\s*[：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?)/
@@ -410,11 +569,9 @@ async function extractOrderFromPopup(page) {
       paymentTime = timeMatch[1].replace(/\//g, '-');
     }
 
-    // 提取购买者信息
-    let buyerMatch = dialogText.match(/买[家者]?\s*[：:]\s*([^\s,，]+)/);
+    const buyerMatch = dialogText.match(/买[家者]?\s*[：:]\s*([^\s,，]+)/);
     const buyerId = buyerMatch ? buyerMatch[1] : '';
 
-    // 关闭弹窗
     try {
       const closeBtn = await dialog.$('[class*="close"], button:has-text("关闭"), button:has-text("×")');
       if (closeBtn) {
@@ -437,16 +594,13 @@ async function extractOrderFromPopup(page) {
     return { orderNumber, paymentTime, buyerId };
   } catch (e) {
     console.error('[浏览器] 提取订单信息异常:', e.message);
-    // 确保关闭弹窗
-    try {
-      await page.keyboard.press('Escape');
-    } catch {}
+    try { await page.keyboard.press('Escape'); } catch {}
     return null;
   }
 }
 
 module.exports = {
-  connectBrowser,
+  launchBrowser,
   enterLiveRoom,
   getTransactionCount,
   getRecentComments,
