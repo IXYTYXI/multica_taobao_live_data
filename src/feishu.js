@@ -3,9 +3,26 @@
  * 负责获取 tenant_access_token 并写入多维表格
  */
 const axios = require('axios');
+const dayjs = require('dayjs');
+const utc = require('dayjs/plugin/utc');
+const timezone = require('dayjs/plugin/timezone');
 const config = require('./config');
 
+dayjs.extend(utc);
+dayjs.extend(timezone);
+
 const FEISHU_BASE = 'https://open.feishu.cn/open-apis';
+
+/**
+ * 将日期字符串转为毫秒时间戳（飞书日期字段格式）
+ * @param {string} dateStr - 日期字符串，如 "2026-07-10 12:00:00"
+ * @returns {number|null} 毫秒时间戳，或 null
+ */
+function toTimestampMs(dateStr) {
+  if (!dateStr) return null;
+  const d = dayjs.tz(dateStr, 'YYYY-MM-DD HH:mm:ss', 'Asia/Shanghai');
+  return d.isValid() ? d.valueOf() : null;
+}
 
 let cachedToken = null;
 let tokenExpiresAt = 0;
@@ -51,13 +68,19 @@ async function writeRecord(record) {
   const token = await getTenantAccessToken();
   const { baseAppToken, tableId } = config.feishu;
 
+  // 字段名对应飞书表格实际列名
   const fields = {
-    '评论者ID': record.commenterID || '',
+    '用户ID': record.commenterID || '',
+    '用户评论': record.commentContent || '',
     '评论时间': record.commentTime || '',
-    '评论内容': record.commentContent || '',
     '订单编号': record.orderNumber || '',
-    '下单时间': record.paymentTime || '',
   };
+
+  // 支付时间是日期字段（type 5），需要毫秒时间戳
+  const payTs = toTimestampMs(record.paymentTime);
+  if (payTs) {
+    fields['支付时间'] = payTs;
+  }
 
   const res = await axios.post(
     `${FEISHU_BASE}/bitable/v1/apps/${baseAppToken}/tables/${tableId}/records`,
@@ -88,15 +111,19 @@ async function writeBatchRecords(records) {
   const token = await getTenantAccessToken();
   const { baseAppToken, tableId } = config.feishu;
 
-  const batchRecords = records.map((record) => ({
-    fields: {
-      '评论者ID': record.commenterID || '',
+  const batchRecords = records.map((record) => {
+    const fields = {
+      '用户ID': record.commenterID || '',
+      '用户评论': record.commentContent || '',
       '评论时间': record.commentTime || '',
-      '评论内容': record.commentContent || '',
       '订单编号': record.orderNumber || '',
-      '下单时间': record.paymentTime || '',
-    },
-  }));
+    };
+    const payTs = toTimestampMs(record.paymentTime);
+    if (payTs) {
+      fields['支付时间'] = payTs;
+    }
+    return { fields };
+  });
 
   const res = await axios.post(
     `${FEISHU_BASE}/bitable/v1/apps/${baseAppToken}/tables/${tableId}/records/batch_create`,
