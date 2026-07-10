@@ -78,32 +78,32 @@ describe('记录构造逻辑', () => {
       commenterID: comment.userId,
       commentTime: comment.time,
       commentContent: comment.content,
-      orderNumber: orderInfo?.orderNumber || '',
+      orderId: orderInfo?.orderId || '',
       paymentTime: orderInfo?.paymentTime || '',
     };
   }
 
   test('有订单信息时完整填充', () => {
     const comment = { userId: 'u1', time: '14:30', content: 'test' };
-    const order = { orderNumber: 'ORD123', paymentTime: '2026-07-10 14:25:00', buyerId: 'b1' };
+    const order = { orderId: 'ORD123', paymentTime: '2026-07-10 14:25:00', buyerId: 'b1' };
     const record = buildRecord(comment, order);
     expect(record.commenterID).toBe('u1');
-    expect(record.orderNumber).toBe('ORD123');
+    expect(record.orderId).toBe('ORD123');
     expect(record.paymentTime).toBe('2026-07-10 14:25:00');
   });
 
   test('无订单信息时字段为空字符串', () => {
     const comment = { userId: 'u1', time: '14:30', content: 'test' };
     const record = buildRecord(comment, null);
-    expect(record.orderNumber).toBe('');
+    expect(record.orderId).toBe('');
     expect(record.paymentTime).toBe('');
   });
 
   test('订单信息部分缺失时正确处理', () => {
     const comment = { userId: 'u1', time: '14:30', content: 'test' };
-    const order = { orderNumber: 'ORD123', paymentTime: '' };
+    const order = { orderId: 'ORD123', paymentTime: '' };
     const record = buildRecord(comment, order);
-    expect(record.orderNumber).toBe('ORD123');
+    expect(record.orderId).toBe('ORD123');
     expect(record.paymentTime).toBe('');
   });
 });

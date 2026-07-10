@@ -65,7 +65,7 @@ async function getTenantAccessToken() {
  * @param {string} record.commenterID - 评论者ID
  * @param {string} record.commentTime - 评论时间
  * @param {string} record.commentContent - 评论内容
- * @param {string} record.orderNumber - 订单编号
+ * @param {string} record.orderId - 订单ID
  * @param {string} record.paymentTime - 下单（支付）时间
  */
 async function writeRecord(record) {
@@ -77,7 +77,7 @@ async function writeRecord(record) {
     '用户ID': record.commenterID || '',
     '用户评论': record.commentContent || '',
     '评论时间': record.commentTime || '',
-    '订单编号': record.orderNumber || '',
+    '订单编号': record.orderId || '',
   };
 
   // 支付时间是日期字段（type 5），需要毫秒时间戳
@@ -120,7 +120,7 @@ async function writeBatchRecords(records) {
       '用户ID': record.commenterID || '',
       '用户评论': record.commentContent || '',
       '评论时间': record.commentTime || '',
-      '订单编号': record.orderNumber || '',
+      '订单编号': record.orderId || '',
     };
     const payTs = toTimestampMs(record.paymentTime);
     if (payTs) {

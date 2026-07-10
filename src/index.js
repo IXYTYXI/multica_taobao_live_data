@@ -52,7 +52,7 @@ async function handleTransactionChange(page) {
       commenterID: comment.userId,
       commentTime: comment.time,
       commentContent: comment.content,
-      orderNumber: orderInfo?.orderNumber || '',
+      orderId: orderInfo?.orderId || '',
       paymentTime: orderInfo?.paymentTime || '',
     };
 

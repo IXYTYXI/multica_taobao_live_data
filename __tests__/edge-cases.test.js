@@ -12,54 +12,65 @@ dayjs.extend(timezone);
 
 const BEIJING_TZ = 'Asia/Shanghai';
 
-describe('跨午夜评论时间边界', () => {
+describe('跨午夜评论时间修正', () => {
   /**
-   * browser.js getRecentComments 中使用 nowBeijing().format('YYYY-MM-DD') 拼接 today 日期
-   * 如果直播跨越午夜 (23:55 → 00:05)，00:05 时获取评论：
-   *   today = 新日期 (07-11)
-   *   评论时间 = "23:58" → 拼成 "07-11 23:58" → 实际上是昨天的 23:58
-   *   cutoff = 00:00 → "07-11 23:58" 在 cutoff 之后 → 被认为是近5分钟的评论
-   * 结果：23:58 的评论会被正确包含吗？
+   * 复现 browser.js getRecentComments 中的跨午夜修正逻辑：
+   * 当解析出的评论时间超过当前时间 1 小时以上时，减去 1 天
    */
-  test('午夜后解析前一天的评论时间可能错误（已知限制）', () => {
-    // 模拟：当前北京时间是 2026-07-11 00:02:00
-    // 有一条评论显示时间 23:58（实际是前一天 07-10 的）
-    const today = '2026-07-11';
-    const commentTimeStr = '23:58:00';
+  function parseCommentTime(commentTimeStr, nowTime) {
+    const now = nowTime || dayjs().tz(BEIJING_TZ);
+    const today = now.format('YYYY-MM-DD');
     const fullTimeStr = `${today} ${commentTimeStr}`;
-    const commentTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+    let commentTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
 
-    // cutoff = 2026-07-11 00:02:00 - 5 分钟 = 2026-07-10 23:57:00
+    // 跨午夜修正
+    if (commentTime.diff(now, 'hour') >= 1) {
+      commentTime = commentTime.subtract(1, 'day');
+    }
+    return commentTime;
+  }
+
+  test('午夜后解析前一天的评论时间 → 正确回退到前一天', () => {
     const now = dayjs.tz('2026-07-11 00:02:00', 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
-    const cutoff = now.subtract(5, 'minute');
+    const commentTime = parseCommentTime('23:58:00', now);
 
-    // 评论时间被拼成 2026-07-11 23:58:00，这比 cutoff (2026-07-10 23:57:00) 晚
-    // 所以会被误判为"近期评论"，但实际上它是"明天 23:58"
-    // 这是一个已知的边界问题：跨午夜时 HH:mm 格式的评论时间会被拼到错误的日期
-    expect(commentTime.isAfter(cutoff)).toBe(true);
-
-    // 实际上这条评论应该被解析为 2026-07-10 23:58:00
-    const correctTime = dayjs.tz('2026-07-10 23:58:00', 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
-    expect(correctTime.isAfter(cutoff)).toBe(true); // 这个也应该在范围内
-
-    // 结论：跨午夜场景下虽然日期拼接错误（07-11 而非 07-10），
-    // 但由于被拼成了"未来的23:58"，isAfter(cutoff) 仍然为 true，
-    // 所以评论仍然会被采集到（行为上偶然正确，但日期记录错误）
+    // 修正后应该是 2026-07-10 23:58:00
+    expect(commentTime.format('YYYY-MM-DD')).toBe('2026-07-10');
+    expect(commentTime.format('HH:mm:ss')).toBe('23:58:00');
   });
 
-  test('午夜前的评论时间在午夜后变成"未来时间"', () => {
-    const today = '2026-07-11'; // 当前日期已经是7月11日
-    const commentTimeStr = '23:55:00'; // 评论在昨天23:55
-
-    const fullTimeStr = `${today} ${commentTimeStr}`;
-    const parsedTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
-
-    // 当前时间是 00:02
+  test('午夜后解析同一天的评论时间 → 不做修正', () => {
     const now = dayjs.tz('2026-07-11 00:02:00', 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+    const commentTime = parseCommentTime('00:01:00', now);
 
-    // 解析出的时间 (07-11 23:55) 比当前时间 (07-11 00:02) 晚约24小时
-    // 这意味着写入飞书的"评论时间"字段会是错误的日期
-    expect(parsedTime.isAfter(now)).toBe(true); // 未来时间！
+    // 00:01 只比 00:02 早 1 分钟，不满足 diff >= 1h，不修正
+    expect(commentTime.format('YYYY-MM-DD')).toBe('2026-07-11');
+  });
+
+  test('正常白天时间不受影响', () => {
+    const now = dayjs.tz('2026-07-11 14:30:00', 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+    const commentTime = parseCommentTime('14:25:00', now);
+
+    expect(commentTime.format('YYYY-MM-DD')).toBe('2026-07-11');
+    expect(commentTime.format('HH:mm:ss')).toBe('14:25:00');
+  });
+
+  test('修正后的评论时间在 5 分钟范围内', () => {
+    const now = dayjs.tz('2026-07-11 00:02:00', 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+    const cutoff = now.subtract(5, 'minute');
+    const commentTime = parseCommentTime('23:58:00', now);
+
+    // 23:58 (07-10) 在 23:57 (07-10) 之后 → 在范围内
+    expect(commentTime.isAfter(cutoff)).toBe(true);
+  });
+
+  test('修正后超出 5 分钟的评论被排除', () => {
+    const now = dayjs.tz('2026-07-11 00:02:00', 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+    const cutoff = now.subtract(5, 'minute');
+    const commentTime = parseCommentTime('23:50:00', now);
+
+    // 23:50 (07-10) 在 23:57 (07-10) 之前 → 超出范围
+    expect(commentTime.isAfter(cutoff)).toBe(false);
   });
 });
 

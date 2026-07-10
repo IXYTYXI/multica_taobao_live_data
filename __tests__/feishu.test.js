@@ -119,7 +119,7 @@ describe('feishu.js API 调用', () => {
       commenterID: 'user_001',
       commentTime: '2026-07-10 14:30:00',
       commentContent: '好看的',
-      orderNumber: 'ORD123456789',
+      orderId: 'ORD123456789',
       paymentTime: '2026-07-10 14:25:00',
     });
 
@@ -149,7 +149,7 @@ describe('feishu.js API 调用', () => {
       commenterID: 'user_002',
       commentTime: '2026-07-10 14:30:00',
       commentContent: '测试评论',
-      orderNumber: '',
+      orderId: '',
       paymentTime: '',
     });
 
@@ -217,8 +217,8 @@ describe('feishu.js API 调用', () => {
     const { writeBatchRecords } = require('../src/feishu');
 
     await writeBatchRecords([
-      { commenterID: 'u1', commentContent: 'c1', commentTime: 't1', orderNumber: '', paymentTime: '' },
-      { commenterID: 'u2', commentContent: 'c2', commentTime: 't2', orderNumber: 'ORD001', paymentTime: '2026-07-10 12:00:00' },
+      { commenterID: 'u1', commentContent: 'c1', commentTime: 't1', orderId: '', paymentTime: '' },
+      { commenterID: 'u2', commentContent: 'c2', commentTime: 't2', orderId: 'ORD001', paymentTime: '2026-07-10 12:00:00' },
     ]);
 
     const writeCall = axios.post.mock.calls[1];

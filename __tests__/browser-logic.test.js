@@ -78,7 +78,7 @@ describe('评论解析正则', () => {
 
 // ─── 订单号提取正则测试 ───────────────────────────────────────────────
 // 来自 browser.js extractOrderFromPopup 中的正则
-const ORDER_REGEX = /订单(?:编号|号)?\s*[：:]\s*(\d+)/;
+const ORDER_REGEX = /订单(?:编号|号|[Ii][Dd])?\s*[：:]\s*(\d+)/;
 const LONG_NUM_REGEX = /\b(\d{15,20})\b/;
 
 describe('订单号提取正则', () => {
@@ -102,6 +102,18 @@ describe('订单号提取正则', () => {
 
   test('匹配"订单：123..."格式（无后缀直接冒号）', () => {
     const match = '订单：1234567890123456'.match(ORDER_REGEX);
+    expect(match).not.toBeNull();
+    expect(match[1]).toBe('1234567890123456');
+  });
+
+  test('匹配"订单ID：123..."格式', () => {
+    const match = '订单ID：1234567890123456'.match(ORDER_REGEX);
+    expect(match).not.toBeNull();
+    expect(match[1]).toBe('1234567890123456');
+  });
+
+  test('匹配"订单id：123..."格式（小写）', () => {
+    const match = '订单id：1234567890123456'.match(ORDER_REGEX);
     expect(match).not.toBeNull();
     expect(match[1]).toBe('1234567890123456');
   });

@@ -577,9 +577,16 @@ async function getRecentComments(page, withinMinutes) {
 
       if (commentMatch) {
         const [, nickname, userId, timeStr, content] = commentMatch;
-        const today = nowBeijing().format('YYYY-MM-DD');
+        const now = nowBeijing();
+        const today = now.format('YYYY-MM-DD');
         const fullTimeStr = `${today} ${timeStr}`;
-        const commentTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+        let commentTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+
+        // 跨午夜修正：如果解析出的评论时间超过当前时间 1 小时以上，
+        // 说明评论实际是前一天的（如 00:02 时解析到 23:58 → 拼成今天 23:58 是错的）
+        if (commentTime.diff(now, 'hour') >= 1) {
+          commentTime = commentTime.subtract(1, 'day');
+        }
 
         if (commentTime.isAfter(cutoff)) {
           comments.push({
@@ -700,14 +707,14 @@ async function extractOrderFromPopup(page) {
     const dialogText = await dialog.textContent();
     if (!dialogText) return null;
 
-    let orderNumber = '';
-    const orderMatch = dialogText.match(/订单(?:编号|号)?\s*[：:]\s*(\d+)/);
+    let orderId = '';
+    const orderMatch = dialogText.match(/订单(?:编号|号|[Ii][Dd])?\s*[：:]\s*(\d+)/);
     if (orderMatch) {
-      orderNumber = orderMatch[1];
+      orderId = orderMatch[1];
     } else {
       const longNumMatch = dialogText.match(/\b(\d{15,20})\b/);
       if (longNumMatch) {
-        orderNumber = longNumMatch[1];
+        orderId = longNumMatch[1];
       }
     }
 
@@ -735,13 +742,13 @@ async function extractOrderFromPopup(page) {
       await page.keyboard.press('Escape');
     }
 
-    if (!orderNumber && !paymentTime) {
+    if (!orderId && !paymentTime) {
       console.log('[浏览器] 订单弹窗中未找到有效数据');
       return null;
     }
 
-    console.log(`[浏览器] 提取到订单: ${orderNumber}, 支付时间: ${paymentTime}`);
-    return { orderNumber, paymentTime, buyerId };
+    console.log(`[浏览器] 提取到订单ID: ${orderId}, 支付时间: ${paymentTime}`);
+    return { orderId, paymentTime, buyerId };
   } catch (e) {
     console.error('[浏览器] 提取订单信息异常:', e.message);
     try { await page.keyboard.press('Escape'); } catch {}
