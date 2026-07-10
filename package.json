@@ -1,0 +1,19 @@
+{
+  "name": "taobao-live-data",
+  "version": "1.0.0",
+  "description": "淘宝直播数据采集工具 - 浏览器自动化 + 飞书写入",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "echo \"No tests yet\" && exit 0"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0",
+    "axios": "^1.7.0",
+    "dayjs": "^1.11.0",
+    "dotenv": "^16.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
