@@ -248,7 +248,8 @@ function copyChromeState(src, dest) {
 }
 
 /**
- * 模式 3: login — 打开全新浏览器，等待用户手动登录
+ * 模式 3: login — 打开浏览器，直接导航到目标页面
+ * 如果被重定向到登录页，等待用户登录后自动回到目标页面
  */
 async function launchForLogin() {
   const localDataDir = config.browser.localDataDir;
@@ -258,8 +259,7 @@ async function launchForLogin() {
     fs.mkdirSync(localDataDir, { recursive: true });
   }
 
-  console.log('[浏览器] 打开浏览器等待手动登录...');
-  console.log('[浏览器] 请在弹出的浏览器中完成淘宝登录');
+  console.log('[浏览器] 打开浏览器...');
   console.log(`[浏览器] 登录超时: ${config.browser.loginTimeoutSeconds} 秒`);
 
   const context = await chromium.launchPersistentContext(localDataDir, {
@@ -277,45 +277,63 @@ async function launchForLogin() {
   const pages = context.pages();
   const page = pages.length > 0 ? pages[0] : await context.newPage();
 
-  // 导航到淘宝登录页
-  await page.goto('https://login.taobao.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  // 直接导航到直播列表（如果未登录会自动跳转到登录页，
+  // 登录成功后 redirect 会把用户带回直播列表）
+  console.log('[浏览器] 导航到淘宝直播中控台...');
+  await page.goto(config.taobao.liveListUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-  console.log('[浏览器] ⏳ 请在浏览器中完成登录，登录成功后会自动继续...');
+  // 检查是否被重定向到登录页
+  const currentUrl = page.url();
+  if (currentUrl.includes('login')) {
+    console.log('[浏览器] ⏳ 需要登录，请在浏览器中完成登录...');
+    console.log('[浏览器] 登录成功后会自动跳转回直播列表页面');
 
-  // 等待用户登录 — 检测页面跳转到非登录页或检测到登录 cookie
-  const startTime = Date.now();
-  while (Date.now() - startTime < timeoutMs) {
-    const url = page.url();
-    // 登录成功后通常会跳转到首页或 redirect 目标
-    if (
-      !url.includes('login.taobao.com') &&
-      !url.includes('login.tmall.com') &&
-      !url.includes('about:blank')
-    ) {
-      console.log('[浏览器] ✅ 检测到登录成功!');
-      break;
+    // 等待用户登录 — 页面必须稳定在非登录 URL 上
+    const startTime = Date.now();
+    let settled = false;
+    while (Date.now() - startTime < timeoutMs) {
+      await new Promise((r) => setTimeout(r, 3000));
+      const url = page.url();
+
+      if (url.includes('liveplatform.taobao.com')) {
+        // URL 到了 liveplatform，再等几秒确认不会弹回 login
+        console.log('[浏览器] 检测到跳转到直播列表，等待页面稳定...');
+        await page.waitForTimeout(5000);
+        const checkUrl = page.url();
+        if (checkUrl.includes('liveplatform.taobao.com')) {
+          console.log('[浏览器] ✅ 登录成功！已稳定在直播列表页面');
+          settled = true;
+          break;
+        } else {
+          console.log('[浏览器] 页面又跳转了，继续等待...');
+        }
+      } else if (!url.includes('login')) {
+        // 跳转到了其他非登录页面（比如淘宝首页）
+        console.log('[浏览器] ✅ 登录成功，已离开登录页');
+        settled = true;
+        break;
+      }
     }
 
-    // 也可以检查 cookie
-    const cookies = await context.cookies('https://taobao.com');
-    const hasLoginCookie = cookies.some(
-      (c) => c.name === 'login' || c.name === '_tb_token_' || c.name === 'munb'
-    );
-    if (hasLoginCookie) {
-      console.log('[浏览器] ✅ 检测到登录 cookie!');
-      break;
+    if (!settled) {
+      console.error('[浏览器] ❌ 登录超时，请重新运行');
+      process.exit(1);
     }
 
-    await new Promise((r) => setTimeout(r, 2000));
+    // 确保最终停留在直播列表页
+    await page.waitForTimeout(2000);
+    const finalUrl = page.url();
+    if (!finalUrl.includes('liveplatform.taobao.com')) {
+      console.log('[浏览器] 当前页面:', finalUrl);
+      console.log('[浏览器] 重新导航到直播列表...');
+      await page.goto(config.taobao.liveListUrl, { waitUntil: 'networkidle', timeout: 60000 });
+      await page.waitForTimeout(5000);
+    }
+  } else {
+    console.log('[浏览器] ✅ 已有登录态，直接进入直播列表');
   }
 
-  if (Date.now() - startTime >= timeoutMs) {
-    console.error('[浏览器] ❌ 登录超时，请重新运行');
-    process.exit(1);
-  }
-
-  // 登录成功后 cookie 已保存在 localDataDir 中，下次可用 profile 模式跳过登录
-  console.log('[浏览器] 登录态已保存，下次可使用 BROWSER_MODE=profile 跳过登录');
+  console.log('[浏览器] 登录态已保存');
   return { browser: null, context, page };
 }
 
@@ -325,10 +343,55 @@ async function launchForLogin() {
  * 导航到直播列表并进入正在直播的场次
  */
 async function enterLiveRoom(page) {
-  console.log('[浏览器] 导航到直播列表页面...');
-  await page.goto(config.taobao.liveListUrl, { waitUntil: 'networkidle', timeout: 30000 });
-  await page.waitForTimeout(3000);
+  // 检查当前页面是否已经是直播列表
+  const currentUrl = page.url();
+  if (!currentUrl.includes('liveplatform.taobao.com')) {
+    console.log('[浏览器] 导航到直播列表页面...');
+    await page.goto(config.taobao.liveListUrl, { waitUntil: 'networkidle', timeout: 60000 });
+  } else {
+    console.log('[浏览器] 已在直播列表页面，等待加载...');
+    await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
+  }
+  await page.waitForTimeout(5000); // 等待页面完全渲染
 
+  // 如果被重定向到登录页，等待用户登录
+  if (page.url().includes('login')) {
+    console.log('[浏览器] ⏳ 页面需要登录，请在浏览器中完成登录...');
+    const timeoutMs = config.browser.loginTimeoutSeconds * 1000;
+    const startTime = Date.now();
+    let settled = false;
+    while (Date.now() - startTime < timeoutMs) {
+      await new Promise(r => setTimeout(r, 3000));
+      const url = page.url();
+
+      if (url.includes('liveplatform.taobao.com')) {
+        // URL 到了 liveplatform，再等几秒确认不会弹回 login
+        console.log('[浏览器] 检测到跳转到直播列表，等待稳定...');
+        await page.waitForTimeout(5000);
+        if (page.url().includes('liveplatform.taobao.com')) {
+          console.log('[浏览器] ✅ 登录成功，已稳定在直播列表');
+          settled = true;
+          break;
+        } else {
+          console.log('[浏览器] 页面又跳转了，继续等待...');
+        }
+      } else if (!url.includes('login')) {
+        // 登录后跳转到其他页面
+        console.log('[浏览器] ✅ 登录成功，重新导航到直播列表...');
+        await page.goto(config.taobao.liveListUrl, { waitUntil: 'networkidle', timeout: 60000 });
+        await page.waitForTimeout(5000);
+        settled = true;
+        break;
+      }
+    }
+
+    if (!settled) {
+      console.error('[浏览器] ❌ 登录超时');
+    }
+    await page.waitForTimeout(3000);
+  }
+
+  console.log('[浏览器] 当前页面:', page.url());
   console.log('[浏览器] 查找正在直播的场次...');
 
   const liveStatusSelectors = [
