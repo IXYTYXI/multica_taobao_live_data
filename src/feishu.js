@@ -169,4 +169,50 @@ async function writeBatchRecords(records) {
   return res.data;
 }
 
-module.exports = { writeRecord, writeBatchRecords };
+/**
+ * 远端对账：查询飞书中是否已存在匹配的记录。
+ * 用于 outbox 重试前排除超时导致的"服务端已写入但客户端不知情"的重复。
+ * @param {Array<Object>} records - 待检查的记录
+ * @returns {Set<string>} 已存在于远端的 recordKey 集合
+ */
+async function findExistingRecordKeys(records) {
+  if (!records || records.length === 0) return new Set();
+
+  const token = await getTenantAccessToken();
+  const { baseAppToken, tableId } = config.feishu;
+  const existingKeys = new Set();
+
+  for (const record of records) {
+    try {
+      const filter = `AND(CurrentValue.[用户ID]="${record.commenterID}",CurrentValue.[评论时间]="${record.commentTime}")`;
+      const res = await axios.get(
+        `${FEISHU_BASE}/bitable/v1/apps/${baseAppToken}/tables/${tableId}/records`,
+        {
+          params: {
+            filter,
+            page_size: 20,
+            field_names: JSON.stringify(['用户ID', '评论时间', '用户评论']),
+          },
+          headers: { Authorization: `Bearer ${token}` },
+          timeout: REQUEST_TIMEOUT_MS,
+        }
+      );
+
+      if (res.data.code === 0 && res.data.data && res.data.data.items) {
+        for (const item of res.data.data.items) {
+          const f = item.fields;
+          if (f['用户评论'] === record.commentContent) {
+            existingKeys.add(`${record.commenterID}_${record.commentTime}_${record.commentContent}`);
+            break;
+          }
+        }
+      }
+    } catch (e) {
+      console.log(`[飞书] 远端对账查询失败 (${record.commenterID}):`, e.message);
+    }
+  }
+
+  return existingKeys;
+}
+
+module.exports = { writeRecord, writeBatchRecords, findExistingRecordKeys };

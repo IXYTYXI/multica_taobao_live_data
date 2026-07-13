@@ -19,7 +19,7 @@ const {
   getOrderInfo,
   nowBeijing,
 } = require('./browser');
-const { writeRecord, writeBatchRecords } = require('./feishu');
+const { writeRecord, writeBatchRecords, findExistingRecordKeys } = require('./feishu');
 
 // ─── 持久化去重 + outbox ──────────────────────────────────────────
 const DATA_DIR = path.resolve(__dirname, '..', 'data');
@@ -82,15 +82,48 @@ let pendingOutbox = loadOutbox();
 // 上一次读到的成交人数
 let lastTransactionCount = null;
 
+// 订单获取重试计数（内存，进程生命周期内有效）
+const orderRetryCount = new Map();
+const MAX_ORDER_RETRIES = 3;
+
 /**
  * 将一批记录写入飞书。写入前先追加到 outbox（write-ahead），
  * 成功后才标记去重并从 outbox 移除。
+ * @param {Array} records
+ * @param {{ isRetry?: boolean }} opts - isRetry=true 时先做远端对账
  */
-async function flushRecords(records) {
+async function flushRecords(records, { isRetry = false } = {}) {
   if (records.length === 0) return;
 
-  const toSend = records.filter(r => !recordedComments.has(recordKey(r)));
+  // 按 key 去重：排除已确认 + 批次内去重（防同批重复发送）
+  const sendMap = new Map();
+  for (const r of records) {
+    const k = recordKey(r);
+    if (!recordedComments.has(k) && !sendMap.has(k)) {
+      sendMap.set(k, r);
+    }
+  }
+  let toSend = [...sendMap.values()];
   if (toSend.length === 0) return;
+
+  // outbox 重试时先做远端对账：排除超时后服务端实际已写入的记录
+  if (isRetry) {
+    try {
+      const remoteExisting = await findExistingRecordKeys(toSend);
+      if (remoteExisting.size > 0) {
+        console.log(`[主程序] 远端对账: ${remoteExisting.size} 条已存在于飞书，跳过`);
+        for (const k of remoteExisting) recordedComments.add(k);
+        saveDedup(recordedComments);
+        toSend = toSend.filter(r => !remoteExisting.has(recordKey(r)));
+      }
+    } catch (e) {
+      console.log('[主程序] 远端对账失败，继续发送:', e.message);
+    }
+    if (toSend.length === 0) {
+      rebuildOutbox();
+      return;
+    }
+  }
 
   // Write-ahead: 确保待发送记录在 outbox 中（崩溃后可恢复）
   const existingKeys = new Set(pendingOutbox.map(recordKey));
@@ -108,8 +141,6 @@ async function flushRecords(records) {
     succeeded.push(...toSend);
     console.log(`[主程序] 成功写入 ${toSend.length} 条记录`);
   } catch (e) {
-    // 4xx = 服务端确认未处理，可安全逐条重试
-    // 网络超时/5xx 可能已部分写入，不立即重试，留 outbox 下轮再试
     if (e.response && e.response.status >= 400 && e.response.status < 500) {
       console.error('[主程序] 批量写入被拒绝，逐条重试:', e.message);
       for (const record of toSend) {
@@ -129,8 +160,15 @@ async function flushRecords(records) {
     recordedComments.add(recordKey(r));
   }
   saveDedup(recordedComments);
+  rebuildOutbox();
 
-  // 重建 outbox：移除已确认的，按 key 去重防膨胀
+  const failCount = toSend.length - succeeded.length;
+  if (failCount > 0) {
+    console.log(`[主程序] ${failCount} 条记录写入失败，保留在 outbox 待重试`);
+  }
+}
+
+function rebuildOutbox() {
   const outboxMap = new Map();
   for (const r of pendingOutbox) {
     const k = recordKey(r);
@@ -140,11 +178,6 @@ async function flushRecords(records) {
   }
   pendingOutbox = [...outboxMap.values()];
   saveOutbox(pendingOutbox);
-
-  const failCount = toSend.length - succeeded.length;
-  if (failCount > 0) {
-    console.log(`[主程序] ${failCount} 条记录写入失败，保留在 outbox 待重试`);
-  }
 }
 
 /**
@@ -176,6 +209,16 @@ async function handleTransactionChange(page) {
 
     const orderInfo = await getOrderInfo(page, comment);
 
+    if (!orderInfo) {
+      const retries = (orderRetryCount.get(key) || 0) + 1;
+      orderRetryCount.set(key, retries);
+      if (retries < MAX_ORDER_RETRIES) {
+        console.log(`[主程序] 订单获取失败 (${retries}/${MAX_ORDER_RETRIES})，下轮重试: ${comment.nickname}`);
+        continue;
+      }
+      console.log(`[主程序] 订单获取已达 ${MAX_ORDER_RETRIES} 次上限，以空订单写入: ${comment.nickname}`);
+    }
+
     const record = {
       commenterID: comment.userId,
       commentTime: comment.time,
@@ -205,10 +248,10 @@ async function monitorLoop(page) {
   console.log(`[主程序] 评论检查范围: 最近 ${config.monitor.commentCheckMinutes} 分钟`);
   console.log(`[主程序] 当前北京时间: ${nowBeijing().format('YYYY-MM-DD HH:mm:ss')}`);
 
-  // 启动时重试 outbox 中残留的失败记录
+  // 启动时重试 outbox 中残留的失败记录（先远端对账防重复）
   if (pendingOutbox.length > 0) {
-    console.log(`[主程序] 发现 ${pendingOutbox.length} 条未成功写入的记录，重试中...`);
-    await flushRecords(pendingOutbox);
+    console.log(`[主程序] 发现 ${pendingOutbox.length} 条未成功写入的记录，对账后重试...`);
+    await flushRecords(pendingOutbox, { isRetry: true });
   }
 
   while (true) {
@@ -240,7 +283,7 @@ async function monitorLoop(page) {
 
       if (pendingOutbox.length > 0) {
         console.log(`[主程序] 重试 outbox 中 ${pendingOutbox.length} 条记录...`);
-        await flushRecords(pendingOutbox);
+        await flushRecords(pendingOutbox, { isRetry: true });
       }
     } catch (e) {
       console.error(`[主程序] 监控循环异常: ${e.message}`);
