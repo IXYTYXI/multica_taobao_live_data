@@ -380,9 +380,13 @@ async function launchForLogin() {
 
 /**
  * 导航到直播列表并进入正在直播的场次
+ *
+ * 淘宝中控台的"直播详情"按钮会在新标签页中打开中控台。
+ * 本函数捕获新标签页并返回正确的 page 对象。
+ *
+ * @returns {Page|null} 中控台页面对象，失败返回 null
  */
 async function enterLiveRoom(page) {
-  // 检查当前页面是否已经是直播列表
   const currentUrl = page.url();
   if (!currentUrl.includes('liveplatform.taobao.com')) {
     console.log('[浏览器] 导航到直播列表页面...');
@@ -391,15 +395,13 @@ async function enterLiveRoom(page) {
     console.log('[浏览器] 已在直播列表页面，等待加载...');
     await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
   }
-  await page.waitForTimeout(5000); // 等待页面完全渲染
+  await page.waitForTimeout(5000);
 
-  // 如果被重定向到登录页，等待用户登录（内容检测，无限等待）
   if (await isStillLoginPage(page)) {
     console.log('[浏览器] ⏳ 页面需要登录，请在浏览器中完成登录...');
     console.log('[浏览器] 浏览器会保持打开，不会自动关闭');
     await waitForLogin(page);
 
-    // 确保在直播列表页
     if (!page.url().includes('liveplatform.taobao.com')) {
       console.log('[浏览器] 重新导航到直播列表...');
       await page.goto(config.taobao.liveListUrl, { waitUntil: 'networkidle', timeout: 60000 });
@@ -448,15 +450,31 @@ async function enterLiveRoom(page) {
     '[class*="action"]:has-text("详情")',
   ];
 
+  const context = page.context();
+
   for (const selector of detailSelectors) {
     try {
       const btn = await page.$(selector);
       if (btn) {
         console.log('[浏览器] 找到"直播详情"入口，点击进入...');
+
+        // 点击"直播详情"可能在新标签页中打开中控台
+        const popupPromise = page.waitForEvent('popup', { timeout: 8000 }).catch(() => null);
         await btn.click();
+        const popup = await popupPromise;
+
+        if (popup) {
+          console.log('[浏览器] 中控台在新标签页中打开');
+          await popup.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+          await popup.waitForTimeout(5000);
+          console.log('[浏览器] 新标签页 URL:', popup.url());
+          return popup;
+        }
+
+        // 没有新标签页 → 在同一页面内导航
         await page.waitForTimeout(5000);
         console.log('[浏览器] 已进入中控台页面');
-        return true;
+        return page;
       }
     } catch {
       continue;
@@ -474,14 +492,84 @@ async function enterLiveRoom(page) {
       (link.text.includes('详情') || link.text.includes('进入') || link.text.includes('中控台'))
     ) {
       console.log(`[浏览器] 找到链接: "${link.text}" -> ${link.href}`);
-      await page.goto(link.href, { waitUntil: 'networkidle', timeout: 30000 });
+
+      const popupPromise = page.waitForEvent('popup', { timeout: 8000 }).catch(() => null);
+      await page.click(`a:has-text("${link.text}")`).catch(async () => {
+        await page.goto(link.href, { waitUntil: 'networkidle', timeout: 30000 });
+      });
+      const popup = await popupPromise;
+
+      if (popup) {
+        console.log('[浏览器] 链接在新标签页中打开');
+        await popup.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+        await popup.waitForTimeout(3000);
+        return popup;
+      }
+
       await page.waitForTimeout(3000);
-      return true;
+      return page;
     }
   }
 
   console.error('[浏览器] 未能找到直播详情入口');
-  return false;
+  return null;
+}
+
+/**
+ * 在所有打开的标签页中查找中控台页面
+ *
+ * 当"直播详情"在新标签页打开时，需要找到正确的页面。
+ * 判断标准：页面 innerText 包含评论格式文本（昵称+括号+时间）
+ */
+async function findActivePage(page) {
+  const context = page.context();
+  const pages = context.pages();
+  console.log(`[浏览器] 当前浏览器共 ${pages.length} 个标签页`);
+
+  const headerRegex = /[\(（][^)）]+[\)）]\s*\d{1,2}:\d{2}/;
+
+  let bestPage = page;
+  let bestScore = 0;
+
+  for (let i = 0; i < pages.length; i++) {
+    try {
+      const info = await pages[i].evaluate(() => {
+        const text = document.body?.innerText || '';
+        return {
+          url: window.location.href,
+          textLength: text.length,
+          hasLiveInteraction: text.includes('直播互动'),
+          sample: text.substring(0, 300),
+        };
+      });
+
+      console.log(`[浏览器] 标签页${i}: url=${info.url.substring(0, 80)}, 文本=${info.textLength}字, 直播互动=${info.hasLiveInteraction}`);
+
+      // 评分：文本量大 + 包含"直播互动" = 最可能是中控台
+      let score = 0;
+      if (info.hasLiveInteraction) score += 100;
+      if (info.textLength > 3000) score += 50;
+      if (info.textLength > 1000) score += 20;
+      if (headerRegex.test(info.sample)) score += 200;
+
+      // 检查是否包含评论格式的文本
+      const hasComments = await pages[i].evaluate((regex) => {
+        const text = document.body?.innerText || '';
+        return new RegExp(regex).test(text);
+      }, headerRegex.source);
+      if (hasComments) score += 200;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestPage = pages[i];
+      }
+    } catch (e) {
+      console.log(`[浏览器] 标签页${i}: 无法访问 (${e.message})`);
+    }
+  }
+
+  console.log(`[浏览器] 选择标签页: ${bestPage.url().substring(0, 80)} (score=${bestScore})`);
+  return bestPage;
 }
 
 /**
@@ -1477,6 +1565,7 @@ async function extractAllOrders(page) {
 module.exports = {
   launchBrowser,
   enterLiveRoom,
+  findActivePage,
   dumpPageDOM,
   debugScanPage,
   getTransactionCount,

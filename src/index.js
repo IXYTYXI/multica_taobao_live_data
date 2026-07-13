@@ -14,6 +14,7 @@ const config = require('./config');
 const {
   launchBrowser,
   enterLiveRoom,
+  findActivePage,
   dumpPageDOM,
   getRecentComments,
   getOrdersFromTab,
@@ -351,14 +352,14 @@ async function main() {
     const { browser, context, page } = await launchBrowser();
 
     // 2. 进入直播间（未找到直播场次时持续重试，不关闭浏览器）
-    let entered = false;
-    while (!entered) {
-      entered = await enterLiveRoom(page);
-      if (!entered) {
+    // enterLiveRoom 返回中控台页面对象（可能是新标签页），失败返回 null
+    let activePage = null;
+    while (!activePage) {
+      activePage = await enterLiveRoom(page);
+      if (!activePage) {
         console.log('[主程序] 未找到正在直播的场次，30 秒后重新检查...');
         console.log('[主程序] 浏览器保持打开，如需登录请在浏览器中操作');
         await new Promise((r) => setTimeout(r, 30000));
-        // 重新加载页面
         try {
           await page.goto(config.taobao.liveListUrl, { waitUntil: 'networkidle', timeout: 60000 });
         } catch (e) {
@@ -367,16 +368,19 @@ async function main() {
       }
     }
 
-    // 3. 等待中控台页面完全加载（商品列表、成交数据等需要额外渲染时间）
+    // 3. 等待中控台页面完全加载
     console.log('[主程序] 已进入中控台页面，等待页面数据加载...');
     await new Promise((r) => setTimeout(r, 8000));
     console.log('[主程序] 页面加载完成');
 
-    // 4. 保存页面 DOM 用于调试（每次启动执行一次）
-    await dumpPageDOM(page);
+    // 4. 确认当前页面是中控台（防止在错误的标签页上运行）
+    activePage = await findActivePage(activePage);
 
-    // 5. 开始监控循环
-    await monitorLoop(page);
+    // 5. 保存页面 DOM 用于调试（每次启动执行一次）
+    await dumpPageDOM(activePage);
+
+    // 6. 开始监控循环
+    await monitorLoop(activePage);
   } catch (e) {
     console.error('[致命错误]', e.message);
     console.error(e.stack);
