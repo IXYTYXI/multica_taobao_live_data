@@ -24,9 +24,18 @@ npm install
 
 ## 浏览器模式
 
-通过 `.env` 中的 `BROWSER_MODE` 选择（默认 `profile`）：
+通过 `.env` 中的 `BROWSER_MODE` 选择（默认 `login`）：
 
-### 方式一：`profile` — 继承本机 Chrome 登录态（推荐）
+### 方式一：`login` — 打开浏览器手动登录（默认）
+
+工具会打开一个浏览器窗口，跳转到淘宝登录页。你在浏览器中完成登录后，工具自动检测到登录成功并继续运行。登录态会保存在本地 `chrome-data/` 目录，下次启动自动恢复。
+
+```bash
+# .env
+BROWSER_MODE=login
+```
+
+### 方式二：`profile` — 继承本机 Chrome 登录态
 
 直接复制你 Chrome 的 cookie 到工具自己的目录，无需重新登录，也不需要关闭正在使用的 Chrome。
 
@@ -39,15 +48,6 @@ CHROME_USER_DATA_DIR=
 
 Windows 默认路径: `C:\Users\<用户名>\AppData\Local\Google\Chrome\User Data`
 macOS 默认路径: `~/Library/Application Support/Google/Chrome`
-
-### 方式二：`login` — 打开浏览器手动登录
-
-工具会打开一个浏览器窗口，跳转到淘宝登录页。你在浏览器中完成登录后，工具自动检测到登录成功并继续运行。登录态会保存在本地 `chrome-data/` 目录，下次可切回 `profile` 模式免登录。
-
-```bash
-# .env
-BROWSER_MODE=login
-```
 
 ### 方式三：`cdp` — 连接已开启调试端口的 Chrome
 
@@ -81,10 +81,9 @@ cp .env.example .env
 | `FEISHU_APP_SECRET` | 飞书应用 App Secret | — |
 | `FEISHU_BASE_APP_TOKEN` | 多维表格 App Token | `D6JAbvNKZaUgMGsTfkPcgXn2nBd` |
 | `FEISHU_TABLE_ID` | 数据表 ID | `tbluFzEQv1KRMsiG` |
-| `BROWSER_MODE` | 浏览器模式 | `profile` |
+| `BROWSER_MODE` | 浏览器模式 | `login` |
 | `CHROME_USER_DATA_DIR` | Chrome 用户数据目录 | 自动检测 |
 | `CHROME_DEBUG_PORT` | Chrome 调试端口（cdp 模式） | `9222` |
-| `LOGIN_TIMEOUT` | 手动登录超时（秒，login 模式） | `300` |
 | `MONITOR_INTERVAL` | 监控间隔（秒） | `10` |
 | `COMMENT_CHECK_MINUTES` | 评论检查范围（分钟） | `5` |
 

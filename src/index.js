@@ -2,12 +2,14 @@
  * 淘宝直播数据采集工具 - 主入口
  *
  * 支持三种浏览器模式（通过 BROWSER_MODE 环境变量设置）：
- *   profile — 复制本机 Chrome 登录态，无需重新登录（默认）
- *   login   — 打开浏览器让用户手动登录
+ *   login   — 打开浏览器让用户手动登录（默认）
+ *   profile — 复制本机 Chrome 登录态，无需重新登录
  *   cdp     — 连接已开启调试端口的 Chrome
  *
  * 所有时间使用北京时间（东八区）
  */
+const fs = require('fs');
+const path = require('path');
 const config = require('./config');
 const {
   launchBrowser,
@@ -19,21 +21,114 @@ const {
 } = require('./browser');
 const { writeRecord, writeBatchRecords } = require('./feishu');
 
-// 已记录的评论ID集合，避免重复写入
-const recordedComments = new Set();
+// ─── 持久化去重 + outbox ──────────────────────────────────────────
+const DATA_DIR = path.resolve(__dirname, '..', 'data');
+const DEDUP_FILE = path.join(DATA_DIR, 'dedup.json');
+const OUTBOX_FILE = path.join(DATA_DIR, 'outbox.json');
+
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+function loadDedup() {
+  try {
+    if (fs.existsSync(DEDUP_FILE)) {
+      return new Set(JSON.parse(fs.readFileSync(DEDUP_FILE, 'utf8')));
+    }
+  } catch (e) {
+    console.error('[持久化] 加载去重文件失败，使用空集合:', e.message);
+  }
+  return new Set();
+}
+
+function saveDedup(set) {
+  ensureDataDir();
+  fs.writeFileSync(DEDUP_FILE, JSON.stringify([...set]), 'utf8');
+}
+
+function loadOutbox() {
+  try {
+    if (fs.existsSync(OUTBOX_FILE)) {
+      return JSON.parse(fs.readFileSync(OUTBOX_FILE, 'utf8'));
+    }
+  } catch (e) {
+    console.error('[持久化] 加载 outbox 失败:', e.message);
+  }
+  return [];
+}
+
+function saveOutbox(records) {
+  ensureDataDir();
+  fs.writeFileSync(OUTBOX_FILE, JSON.stringify(records, null, 2), 'utf8');
+}
+
+const recordedComments = loadDedup();
+let pendingOutbox = loadOutbox();
 
 // 上一次读到的成交人数
 let lastTransactionCount = null;
 
 /**
+ * 将一批记录写入飞书，成功后才标记去重。失败的留在 outbox 中。
+ */
+async function flushRecords(records) {
+  if (records.length === 0) return;
+
+  const succeeded = [];
+  const failed = [];
+
+  // 先尝试批量写入
+  try {
+    await writeBatchRecords(records);
+    succeeded.push(...records);
+    console.log(`[主程序] 成功写入 ${records.length} 条记录`);
+  } catch (e) {
+    console.error('[主程序] 批量写入失败，逐条重试:', e.message);
+    for (const record of records) {
+      try {
+        await writeRecord(record);
+        succeeded.push(record);
+      } catch (err) {
+        console.error(`[主程序] 单条写入失败: ${record.commenterID}`, err.message);
+        failed.push(record);
+      }
+    }
+  }
+
+  // 只有成功写入的才加入去重集合
+  for (const record of succeeded) {
+    const key = `${record.commenterID}_${record.commentTime}_${record.commentContent}`;
+    recordedComments.add(key);
+  }
+  saveDedup(recordedComments);
+
+  // 失败的留在 outbox
+  pendingOutbox = [...pendingOutbox.filter((r) => {
+    const k = `${r.commenterID}_${r.commentTime}_${r.commentContent}`;
+    return !recordedComments.has(k);
+  }), ...failed];
+  saveOutbox(pendingOutbox);
+
+  if (failed.length > 0) {
+    console.log(`[主程序] ${failed.length} 条记录写入失败，已保存到 outbox 待重试`);
+  }
+}
+
+/**
  * 处理一次成交人数变化事件
  */
 async function handleTransactionChange(page) {
-  const comments = await getRecentComments(page, config.monitor.commentCheckMinutes);
+  const result = await getRecentComments(page, config.monitor.commentCheckMinutes);
 
+  if (result.error) {
+    console.error('[主程序] 采集评论出错，跳过本轮（不推进水位线）:', result.error);
+    return false;
+  }
+
+  const comments = result.comments;
   if (comments.length === 0) {
     console.log('[主程序] 近期无新评论');
-    return;
+    return true;
   }
 
   const newRecords = [];
@@ -57,25 +152,14 @@ async function handleTransactionChange(page) {
     };
 
     newRecords.push(record);
-    recordedComments.add(key);
   }
 
   if (newRecords.length > 0) {
     console.log(`[主程序] 准备写入 ${newRecords.length} 条新记录到飞书...`);
-    try {
-      await writeBatchRecords(newRecords);
-      console.log(`[主程序] 成功写入 ${newRecords.length} 条记录`);
-    } catch (e) {
-      console.error(`[主程序] 写入飞书失败:`, e.message);
-      for (const record of newRecords) {
-        try {
-          await writeRecord(record);
-        } catch (err) {
-          console.error(`[主程序] 单条写入也失败: ${record.commenterID}`, err.message);
-        }
-      }
-    }
+    await flushRecords(newRecords);
   }
+
+  return true;
 }
 
 /**
@@ -87,6 +171,12 @@ async function monitorLoop(page) {
   console.log(`[主程序] 开始监控，检查间隔: ${config.monitor.intervalSeconds}秒`);
   console.log(`[主程序] 评论检查范围: 最近 ${config.monitor.commentCheckMinutes} 分钟`);
   console.log(`[主程序] 当前北京时间: ${nowBeijing().format('YYYY-MM-DD HH:mm:ss')}`);
+
+  // 启动时重试 outbox 中残留的失败记录
+  if (pendingOutbox.length > 0) {
+    console.log(`[主程序] 发现 ${pendingOutbox.length} 条未成功写入的记录，重试中...`);
+    await flushRecords(pendingOutbox);
+  }
 
   while (true) {
     try {
@@ -102,10 +192,23 @@ async function monitorLoop(page) {
           `[主程序] [${nowBeijing().format('HH:mm:ss')}] ` +
           `成交人数变化: ${lastTransactionCount} -> ${currentCount} (+${currentCount - lastTransactionCount})`
         );
-        lastTransactionCount = currentCount;
-        await handleTransactionChange(page);
+        const prevCount = lastTransactionCount;
+        const ok = await handleTransactionChange(page);
+        // 只有采集成功才推进水位线
+        if (ok) {
+          lastTransactionCount = currentCount;
+        } else {
+          lastTransactionCount = prevCount;
+          console.log('[主程序] 采集失败，水位线不推进，下次仍会触发');
+        }
       } else {
         console.log(`[主程序] [${nowBeijing().format('HH:mm:ss')}] 成交人数无变化: ${currentCount}`);
+      }
+
+      // 定期重试 outbox
+      if (pendingOutbox.length > 0) {
+        console.log(`[主程序] 重试 outbox 中 ${pendingOutbox.length} 条记录...`);
+        await flushRecords([...pendingOutbox]);
       }
     } catch (e) {
       console.error(`[主程序] 监控循环异常: ${e.message}`);
@@ -161,16 +264,19 @@ async function main() {
   }
 }
 
-// 优雅退出
-process.on('SIGINT', () => {
-  console.log('\n[主程序] 收到中断信号，正在退出...');
+// 优雅退出 — 确保去重集合和 outbox 持久化
+function gracefulExit(signal) {
+  console.log(`\n[主程序] 收到 ${signal} 信号，正在退出...`);
   console.log(`[主程序] 本次运行共记录 ${recordedComments.size} 条评论`);
+  if (pendingOutbox.length > 0) {
+    console.log(`[主程序] ${pendingOutbox.length} 条记录未成功写入，已保存到 outbox，下次启动时重试`);
+  }
+  saveDedup(recordedComments);
+  saveOutbox(pendingOutbox);
   process.exit(0);
-});
+}
 
-process.on('SIGTERM', () => {
-  console.log('\n[主程序] 收到终止信号，正在退出...');
-  process.exit(0);
-});
+process.on('SIGINT', () => gracefulExit('SIGINT'));
+process.on('SIGTERM', () => gracefulExit('SIGTERM'));
 
 main();

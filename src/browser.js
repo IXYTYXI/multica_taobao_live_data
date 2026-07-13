@@ -534,6 +534,7 @@ async function getTransactionCount(page) {
 
 /**
  * 获取近期评论
+ * @returns {{ comments: Array, error: string|null }} 返回结构化结果，error 非 null 表示采集异常
  */
 async function getRecentComments(page, withinMinutes) {
   const cutoff = nowBeijing().subtract(withinMinutes, 'minute');
@@ -548,7 +549,7 @@ async function getRecentComments(page, withinMinutes) {
       await page.waitForTimeout(1000);
     }
   } catch {
-    // 忽略
+    // tab 切换失败不影响采集
   }
 
   try {
@@ -573,8 +574,7 @@ async function getRecentComments(page, withinMinutes) {
         const fullTimeStr = `${today} ${timeStr}`;
         let commentTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
 
-        // 跨午夜修正：如果解析出的评论时间超过当前时间 1 小时以上，
-        // 说明评论实际是前一天的（如 00:02 时解析到 23:58 → 拼成今天 23:58 是错的）
+        // 跨午夜修正
         if (commentTime.diff(now, 'hour') >= 1) {
           commentTime = commentTime.subtract(1, 'day');
         }
@@ -592,14 +592,17 @@ async function getRecentComments(page, withinMinutes) {
     }
   } catch (e) {
     console.error('[浏览器] 获取评论异常:', e.message);
+    return { comments: [], error: e.message };
   }
 
   console.log(`[浏览器] 获取到 ${comments.length} 条近期评论`);
-  return comments;
+  return { comments, error: null };
 }
 
 /**
  * 查看订单信息
+ * 只在评论元素附近查找订单入口，不全页扫描（防止关联到错误评论）
+ * 提取后验证 buyerId 与评论用户匹配
  */
 async function getOrderInfo(page, comment) {
   try {
@@ -614,6 +617,7 @@ async function getOrderInfo(page, comment) {
       '[class*="icon"]:near(:text("订单"))',
     ];
 
+    // 只在评论元素的父容器范围内查找订单入口
     if (comment.element) {
       try {
         const parent = await comment.element.evaluateHandle((el) =>
@@ -625,45 +629,24 @@ async function getOrderInfo(page, comment) {
             if (icon) {
               await icon.click();
               await page.waitForTimeout(2000);
-              return await extractOrderFromPopup(page);
+              const orderInfo = await extractOrderFromPopup(page);
+              if (!orderInfo) return null;
+              // 验证买家与评论者匹配
+              if (orderInfo.buyerId && comment.userId && orderInfo.buyerId !== comment.userId) {
+                console.log(`[浏览器] 订单买家(${orderInfo.buyerId})与评论者(${comment.userId})不匹配，跳过`);
+                return null;
+              }
+              return orderInfo;
             }
           }
         }
       } catch {
-        // 忽略
+        // 元素可能已失效
       }
     }
 
-    for (const sel of orderIconSelectors) {
-      try {
-        const icon = await page.$(sel);
-        if (icon) {
-          await icon.click();
-          await page.waitForTimeout(2000);
-          return await extractOrderFromPopup(page);
-        }
-      } catch {
-        continue;
-      }
-    }
-
-    try {
-      const bottomIcons = await page.$$('[class*="toolbar"] svg, [class*="toolbar"] i, [class*="bottom"] svg, [class*="bottom"] i');
-      for (const icon of bottomIcons) {
-        const title = await icon.getAttribute('title');
-        const ariaLabel = await icon.getAttribute('aria-label');
-        if (
-          (title && title.includes('订单')) ||
-          (ariaLabel && ariaLabel.includes('订单'))
-        ) {
-          await icon.click();
-          await page.waitForTimeout(2000);
-          return await extractOrderFromPopup(page);
-        }
-      }
-    } catch {
-      // 忽略
-    }
+    // 没有在评论附近找到订单入口，不做全页扫描
+    console.log(`[浏览器] 评论附近未找到订单入口，跳过订单关联`);
   } catch (e) {
     console.error('[浏览器] 查看订单异常:', e.message);
   }

@@ -12,6 +12,24 @@ dayjs.extend(utc);
 dayjs.extend(timezone);
 
 const FEISHU_BASE = 'https://open.feishu.cn/open-apis';
+const REQUEST_TIMEOUT_MS = 15000;
+const MAX_RETRIES = 3;
+
+async function axiosWithRetry(requestFn) {
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await requestFn();
+    } catch (e) {
+      const isLast = attempt === MAX_RETRIES;
+      const isRetryable = e.code === 'ECONNABORTED' || e.code === 'ETIMEDOUT' ||
+        e.code === 'ECONNRESET' || !e.response || (e.response && e.response.status >= 500);
+      if (isLast || !isRetryable) throw e;
+      const delay = 1000 * Math.pow(2, attempt - 1);
+      console.log(`[飞书] 请求失败 (${e.message})，${delay / 1000}s 后第 ${attempt + 1} 次重试...`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+}
 
 /**
  * 将日期字符串转为毫秒时间戳（飞书日期字段格式）
@@ -40,13 +58,14 @@ async function getTenantAccessToken() {
     return cachedToken;
   }
 
-  const res = await axios.post(
+  const res = await axiosWithRetry(() => axios.post(
     `${FEISHU_BASE}/auth/v3/tenant_access_token/internal`,
     {
       app_id: config.feishu.appId,
       app_secret: config.feishu.appSecret,
-    }
-  );
+    },
+    { timeout: REQUEST_TIMEOUT_MS }
+  ));
 
   if (res.data.code !== 0) {
     throw new Error(`获取飞书 token 失败: ${res.data.msg}`);
@@ -86,7 +105,7 @@ async function writeRecord(record) {
     fields['支付时间'] = payTs;
   }
 
-  const res = await axios.post(
+  const res = await axiosWithRetry(() => axios.post(
     `${FEISHU_BASE}/bitable/v1/apps/${baseAppToken}/tables/${tableId}/records`,
     { fields },
     {
@@ -94,8 +113,9 @@ async function writeRecord(record) {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
+      timeout: REQUEST_TIMEOUT_MS,
     }
-  );
+  ));
 
   if (res.data.code !== 0) {
     throw new Error(`写入飞书失败: ${JSON.stringify(res.data)}`);
@@ -129,7 +149,7 @@ async function writeBatchRecords(records) {
     return { fields };
   });
 
-  const res = await axios.post(
+  const res = await axiosWithRetry(() => axios.post(
     `${FEISHU_BASE}/bitable/v1/apps/${baseAppToken}/tables/${tableId}/records/batch_create`,
     { records: batchRecords },
     {
@@ -137,8 +157,9 @@ async function writeBatchRecords(records) {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
+      timeout: REQUEST_TIMEOUT_MS,
     }
-  );
+  ));
 
   if (res.data.code !== 0) {
     throw new Error(`批量写入飞书失败: ${JSON.stringify(res.data)}`);

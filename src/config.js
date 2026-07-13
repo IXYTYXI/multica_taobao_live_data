@@ -34,9 +34,6 @@ const config = {
 
     // 本工具自己的持久化浏览器数据目录（login 模式用）
     localDataDir: process.env.LOCAL_BROWSER_DATA_DIR || path.resolve(__dirname, '..', 'chrome-data'),
-
-    // login 模式: 等待登录的超时时间（秒）
-    loginTimeoutSeconds: parseInt(process.env.LOGIN_TIMEOUT || '300', 10),
   },
 
   // 淘宝直播中控台
