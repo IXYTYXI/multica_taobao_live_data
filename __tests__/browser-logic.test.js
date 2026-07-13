@@ -77,7 +77,7 @@ describe('评论解析正则', () => {
 });
 
 // ─── 订单号提取正则测试 ───────────────────────────────────────────────
-// 来自 browser.js extractOrderFromPopup 中的正则
+// 来自 browser.js extractAllOrders 中的正则
 const ORDER_REGEX = /订单(?:编号|号|[Ii][Dd])?\s*[：:]\s*(\d+)/;
 const LONG_NUM_REGEX = /\b(\d{15,20})\b/;
 

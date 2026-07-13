@@ -14,9 +14,10 @@ const config = require('./config');
 const {
   launchBrowser,
   enterLiveRoom,
+  dumpPageDOM,
   getRecentComments,
   getOrdersFromTab,
-  getOrderInfo,
+  extractAllOrders,
   nowBeijing,
 } = require('./browser');
 const { writeRecord, writeBatchRecords, findExistingRecordKeys } = require('./feishu');
@@ -79,9 +80,6 @@ function recordKey(r) {
 const recordedComments = loadDedup();
 let pendingOutbox = loadOutbox();
 
-// 订单获取重试计数（内存，进程生命周期内有效）
-const orderRetryCount = new Map();
-const MAX_ORDER_RETRIES = 3;
 
 /**
  * 将一批记录写入飞书。写入前先追加到 outbox（write-ahead），
@@ -182,7 +180,8 @@ function rebuildOutbox() {
  *
  * 1. 先从"全部"标签获取评论（包括"已下单"条目）
  * 2. 再从"已下单"标签获取订单条目（可能捕获到"全部"标签遗漏的）
- * 3. 合并去重后处理
+ * 3. 打开订单弹窗提取所有订单（表格结构：商品标题/下单时间/支付时间/订单ID）
+ * 4. 按时间匹配关联"已下单"条目与订单ID
  */
 async function processNewComments(page) {
   // 1. 获取"全部"标签中的评论
@@ -215,7 +214,25 @@ async function processNewComments(page) {
     return true;
   }
 
+  // 4. 检查是否有新的"已下单"条目需要关联订单
+  const hasNewOrderEntries = allEntries.some(e => {
+    const k = recordKey({ commenterID: e.userId, commentTime: e.time, commentContent: e.content });
+    return !recordedComments.has(k) &&
+      (e.content === '已下单' || (e.content && e.content.includes('已下单')));
+  });
+
+  // 5. 如果有新的"已下单"条目，打开订单弹窗提取全部订单
+  let allOrders = [];
+  if (hasNewOrderEntries) {
+    allOrders = await extractAllOrders(page);
+    if (allOrders.length > 0) {
+      console.log(`[主程序] 从订单弹窗获取到 ${allOrders.length} 条订单`);
+    }
+  }
+
+  // 6. 处理所有条目
   const newRecords = [];
+  const usedOrderIds = new Set();
 
   for (const comment of allEntries) {
     const key = `${comment.userId}_${comment.time}_${comment.content}`;
@@ -225,22 +242,38 @@ async function processNewComments(page) {
 
     console.log(`[主程序] 处理: ${comment.nickname}(${comment.userId}) ${comment.time} - ${comment.content}`);
 
-    // 对"已下单"条目和普通评论都尝试获取订单信息
-    const orderInfo = await getOrderInfo(page, comment);
+    // 对"已下单"条目，按分钟级时间匹配订单
+    let matchedOrder = null;
+    const isOrderEntry = comment.content === '已下单' || (comment.content && comment.content.includes('已下单'));
 
-    if (!orderInfo) {
-      // 对"已下单"类型条目，重试更积极（一定有订单）
-      const isOrderEntry = comment.content === '已下单' || (comment.content && comment.content.includes('已下单'));
-      const maxRetries = isOrderEntry ? MAX_ORDER_RETRIES : 1;
-
-      const retries = (orderRetryCount.get(key) || 0) + 1;
-      orderRetryCount.set(key, retries);
-      if (retries < maxRetries) {
-        console.log(`[主程序] 订单获取失败 (${retries}/${maxRetries})，下轮重试: ${comment.nickname}`);
-        continue;
+    if (isOrderEntry && allOrders.length > 0) {
+      const commentMinute = comment.time.substring(0, 16); // "YYYY-MM-DD HH:mm"
+      for (const order of allOrders) {
+        if (usedOrderIds.has(order.orderId)) continue;
+        const orderTimeNorm = (order.orderTime || order.paymentTime || '').substring(0, 16);
+        if (commentMinute === orderTimeNorm) {
+          matchedOrder = order;
+          usedOrderIds.add(order.orderId);
+          console.log(`[主程序] 匹配到订单: ${order.orderId}`);
+          break;
+        }
       }
-      if (isOrderEntry) {
-        console.log(`[主程序] "已下单"条目订单获取已达 ${maxRetries} 次上限，以空订单写入: ${comment.nickname}`);
+      if (!matchedOrder) {
+        // 放宽到±2分钟内匹配
+        const cParts = commentMinute.split(/[-: T]/);
+        const cMin = parseInt(cParts[3] || '0', 10) * 60 + parseInt(cParts[4] || '0', 10);
+        for (const order of allOrders) {
+          if (usedOrderIds.has(order.orderId)) continue;
+          const oTime = (order.orderTime || order.paymentTime || '').substring(0, 16);
+          const oParts = oTime.split(/[-: T]/);
+          const oMin = parseInt(oParts[3] || '0', 10) * 60 + parseInt(oParts[4] || '0', 10);
+          if (Math.abs(cMin - oMin) <= 2) {
+            matchedOrder = order;
+            usedOrderIds.add(order.orderId);
+            console.log(`[主程序] 近似匹配到订单: ${order.orderId}`);
+            break;
+          }
+        }
       }
     }
 
@@ -248,8 +281,8 @@ async function processNewComments(page) {
       commenterID: comment.userId,
       commentTime: comment.time,
       commentContent: comment.content,
-      orderId: orderInfo?.orderId || '',
-      paymentTime: orderInfo?.paymentTime || '',
+      orderId: matchedOrder?.orderId || '',
+      paymentTime: matchedOrder?.paymentTime || '',
     };
 
     newRecords.push(record);
@@ -339,7 +372,10 @@ async function main() {
     await new Promise((r) => setTimeout(r, 8000));
     console.log('[主程序] 页面加载完成');
 
-    // 4. 开始监控循环
+    // 4. 保存页面 DOM 用于调试（每次启动执行一次）
+    await dumpPageDOM(page);
+
+    // 5. 开始监控循环
     await monitorLoop(page);
   } catch (e) {
     console.error('[致命错误]', e.message);

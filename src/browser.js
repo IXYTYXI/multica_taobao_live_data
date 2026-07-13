@@ -563,13 +563,49 @@ async function getTransactionCount(page) {
 }
 
 /**
- * 在评论区（左侧面板）中点击指定标签
- * 用页面位置判断避免误点右侧商品区的同名元素（如"全部商品"）
+ * 保存当前页面完整 HTML 到 data/page-dump.html，用于调试 DOM 结构
+ */
+async function dumpPageDOM(page) {
+  try {
+    const html = await page.content();
+    const dumpDir = path.resolve(__dirname, '..', 'data');
+    if (!fs.existsSync(dumpDir)) fs.mkdirSync(dumpDir, { recursive: true });
+    const dumpPath = path.join(dumpDir, 'page-dump.html');
+    fs.writeFileSync(dumpPath, html, 'utf8');
+    console.log(`[浏览器] DOM 已保存到 ${dumpPath} (${(html.length / 1024).toFixed(1)} KB)`);
+  } catch (e) {
+    console.error('[浏览器] DOM dump 失败:', e.message);
+  }
+}
+
+/**
+ * 在"直播互动"区域内点击指定标签
+ * 先定位"直播互动"容器，再在其中查找标签，避免误点右侧"口袋商品"区域
  */
 async function clickCommentTab(page, tabText) {
   try {
     const clicked = await page.evaluate((text) => {
-      for (const el of document.querySelectorAll('div, span, a, button, li, label')) {
+      // 先定位"直播互动"标题所在的容器
+      const walker = document.createTreeWalker(
+        document.body, NodeFilter.SHOW_TEXT, null
+      );
+      let interactionContainer = null;
+      while (walker.nextNode()) {
+        if (walker.currentNode.textContent.trim() === '直播互动') {
+          let el = walker.currentNode.parentElement;
+          for (let i = 0; i < 8 && el; i++) {
+            if (el.getBoundingClientRect().height > 200) {
+              interactionContainer = el;
+              break;
+            }
+            el = el.parentElement;
+          }
+          break;
+        }
+      }
+
+      const searchRoot = interactionContainer || document.body;
+      for (const el of searchRoot.querySelectorAll('div, span, a, button, li, label')) {
         if (el.children.length > 5) continue;
         const ownText = el.textContent?.trim();
         if (ownText !== text) continue;
@@ -616,9 +652,9 @@ function parseCommentTime(timeStr) {
 /**
  * 获取近期评论
  *
- * 不依赖特定 CSS class 名（淘宝使用 hash/混淆类名），
- * 而是通过文本模式匹配 + 页面位置（左侧面板）来识别评论元素。
- * 分两阶段：先在浏览器内标记匹配元素，再获取 element handle。
+ * 使用 TreeWalker 遍历文本节点，用正则匹配评论头部 昵称(用户ID) HH:mm，
+ * 匹配到的节点的下一个兄弟/子元素即为评论内容。不依赖 CSS class 名。
+ * 如果文本节点扫描无结果，回退到元素级文本匹配。
  */
 async function getRecentComments(page, withinMinutes) {
   const cutoff = nowBeijing().subtract(withinMinutes, 'minute');
@@ -629,108 +665,150 @@ async function getRecentComments(page, withinMinutes) {
   const comments = [];
 
   try {
-    // Phase 1: 在浏览器内扫描 DOM，标记匹配评论模式的元素
-    const diagnostics = await page.evaluate(() => {
-      // 清除旧标记
-      document.querySelectorAll('[data-tb-idx]').forEach(el => {
-        el.removeAttribute('data-tb-idx');
-        el.removeAttribute('data-tb-nickname');
-        el.removeAttribute('data-tb-userid');
-        el.removeAttribute('data-tb-time');
-        el.removeAttribute('data-tb-content');
-      });
-
-      // 评论模式: 昵称[(用户ID)] [空白] HH:MM[:SS] [换行/空白] 内容
-      const regex = /([^\s\n(]{1,30})(?:\(([^)]+)\))?\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*([\s\S]+)/;
-      let idx = 0;
+    const rawComments = await page.evaluate(() => {
+      const results = [];
       const seen = new Set();
-      const diag = { total: 0, leftPanel: 0, sizeOk: 0, matched: 0, tagged: 0 };
+      const headerRegex = /(.+?)\(([^)]+)\)\s+(\d{1,2}:\d{2}(?::\d{2})?)/;
 
-      for (const el of document.querySelectorAll('div, li, p, article, section, span')) {
-        diag.total++;
+      // ── Pass 1: TreeWalker 文本节点扫描 ──
+      const walker = document.createTreeWalker(
+        document.body, NodeFilter.SHOW_TEXT, null
+      );
+      while (walker.nextNode()) {
+        const nodeText = walker.currentNode.textContent.trim();
+        if (!nodeText || nodeText.length < 5 || nodeText.length > 200) continue;
 
-        const rect = el.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) continue;
-        // 评论区在页面左侧
-        if (rect.left > window.innerWidth * 0.5) continue;
-        diag.leftPanel++;
-
-        if (rect.height > 200 || rect.height < 8) continue;
-        diag.sizeOk++;
-
-        const text = el.textContent?.trim();
-        if (!text || text.length < 3 || text.length > 500) continue;
-        // 跳过包含大量子元素的容器
-        if (el.querySelectorAll('div, li, p, span').length > 20) continue;
-
-        const match = text.match(regex);
+        const match = nodeText.match(headerRegex);
         if (!match) continue;
-        diag.matched++;
 
-        const [, nickname, userId, timeStr, rawContent] = match;
+        const [fullMatch, nickname, userId, timeStr] = match;
         const hour = parseInt(timeStr.split(':')[0], 10);
         if (hour > 23) continue;
+        if (nickname.includes('AI助理') || nickname.includes('问答助手')) continue;
 
-        const content = rawContent.trim().split(/[\n\r]+/)[0]?.trim() || '';
+        const headerEl = walker.currentNode.parentElement;
+        if (!headerEl) continue;
+
+        const rect = headerEl.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.left > window.innerWidth * 0.5) continue;
+
+        // 查找评论内容
+        let content = '';
+
+        // Case 1: 时间之后同一文本节点中还有内容
+        const afterTime = nodeText.substring(nodeText.indexOf(timeStr) + timeStr.length).trim();
+        if (afterTime) {
+          content = afterTime.split(/[\n\r]+/)[0].trim();
+        }
+
+        // Case 2: 头部元素的下一个兄弟元素
+        if (!content) {
+          const nextSib = headerEl.nextElementSibling;
+          if (nextSib) {
+            const sibText = nextSib.textContent?.trim();
+            if (sibText && sibText.length < 300 && !sibText.match(headerRegex)) {
+              content = sibText.split(/[\n\r]+/)[0].trim();
+            }
+          }
+        }
+
+        // Case 3: 父容器内，头部元素之后的第一个子元素
+        if (!content && headerEl.parentElement) {
+          const parent = headerEl.parentElement;
+          let foundHeader = false;
+          for (const child of parent.children) {
+            if (child === headerEl) { foundHeader = true; continue; }
+            if (foundHeader) {
+              const childText = child.textContent?.trim();
+              if (childText && childText.length < 300 && !childText.match(headerRegex)) {
+                content = childText.split(/[\n\r]+/)[0].trim();
+                break;
+              }
+            }
+          }
+        }
+
+        // Case 4: 同一元素内，textContent 中头部匹配之后的文本
+        if (!content) {
+          const fullText = (headerEl.parentElement || headerEl).textContent?.trim() || '';
+          const matchIdx = fullText.indexOf(fullMatch);
+          if (matchIdx >= 0) {
+            const afterMatch = fullText.substring(matchIdx + fullMatch.length).trim();
+            if (afterMatch) {
+              content = afterMatch.split(/[\n\r]+/)[0].trim();
+            }
+          }
+        }
+
         if (!content) continue;
-
-        // 跳过 AI/系统消息
-        if (text.includes('AI助理') || text.includes('问答助手')) continue;
         if (content.startsWith('私密回复')) continue;
 
-        const key = `${nickname}_${userId || ''}_${timeStr}_${content}`;
+        const key = `${nickname.trim()}_${userId}_${timeStr}_${content}`;
         if (seen.has(key)) continue;
         seen.add(key);
 
-        el.setAttribute('data-tb-idx', String(idx));
-        el.setAttribute('data-tb-nickname', nickname.trim());
-        el.setAttribute('data-tb-userid', (userId || nickname).trim());
-        el.setAttribute('data-tb-time', timeStr);
-        el.setAttribute('data-tb-content', content);
-        idx++;
-        diag.tagged++;
+        results.push({
+          nickname: nickname.trim(),
+          userId: userId.trim(),
+          timeStr,
+          content,
+        });
       }
 
-      return diag;
+      // ── Pass 2: 元素级回退（TreeWalker 无结果时） ──
+      if (results.length === 0) {
+        const elemRegex = /(.+?)\(([^)]+)\)\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*([\s\S]+)/;
+        for (const el of document.querySelectorAll('div, li, p, span')) {
+          const rect = el.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+          if (rect.left > window.innerWidth * 0.5) continue;
+          if (rect.height > 200 || rect.height < 8) continue;
+
+          const text = el.textContent?.trim();
+          if (!text || text.length < 5 || text.length > 500) continue;
+          if (el.querySelectorAll('div, li, p, span').length > 20) continue;
+
+          const m = text.match(elemRegex);
+          if (!m) continue;
+
+          const [, nick, uid, ts, rawContent] = m;
+          const h = parseInt(ts.split(':')[0], 10);
+          if (h > 23) continue;
+          if (nick.includes('AI助理') || nick.includes('问答助手')) continue;
+
+          const c = rawContent.trim().split(/[\n\r]+/)[0]?.trim() || '';
+          if (!c || c.startsWith('私密回复')) continue;
+
+          const k = `${nick.trim()}_${uid}_${ts}_${c}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+
+          results.push({
+            nickname: nick.trim(),
+            userId: uid.trim(),
+            timeStr: ts,
+            content: c,
+          });
+        }
+      }
+
+      return { results, pass: results.length > 0 ? 'treewalker' : 'fallback' };
     });
 
-    console.log(
-      `[浏览器] 评论扫描: 总${diagnostics.total} → 左侧${diagnostics.leftPanel} → 尺寸${diagnostics.sizeOk} → 模式匹配${diagnostics.matched} → 标记${diagnostics.tagged}`
-    );
+    console.log(`[浏览器] 评论扫描 (${rawComments.pass}): 找到 ${rawComments.results.length} 条`);
 
-    // Phase 2: 获取标记元素的 handles
-    const taggedElements = await page.$$('[data-tb-idx]');
+    for (const c of rawComments.results) {
+      const commentTime = parseCommentTime(c.timeStr);
+      if (!commentTime.isValid() || !commentTime.isAfter(cutoff)) continue;
 
-    for (const el of taggedElements) {
-      try {
-        const nickname = await el.getAttribute('data-tb-nickname');
-        const userId = await el.getAttribute('data-tb-userid');
-        const timeStr = await el.getAttribute('data-tb-time');
-        const content = await el.getAttribute('data-tb-content');
-
-        const commentTime = parseCommentTime(timeStr);
-        if (!commentTime.isValid() || !commentTime.isAfter(cutoff)) continue;
-
-        comments.push({
-          nickname,
-          userId,
-          time: commentTime.format('YYYY-MM-DD HH:mm:ss'),
-          content,
-          element: el,
-        });
-      } catch {}
-    }
-
-    // Phase 3: 清除标记
-    await page.evaluate(() => {
-      document.querySelectorAll('[data-tb-idx]').forEach(el => {
-        el.removeAttribute('data-tb-idx');
-        el.removeAttribute('data-tb-nickname');
-        el.removeAttribute('data-tb-userid');
-        el.removeAttribute('data-tb-time');
-        el.removeAttribute('data-tb-content');
+      comments.push({
+        nickname: c.nickname,
+        userId: c.userId,
+        time: commentTime.format('YYYY-MM-DD HH:mm:ss'),
+        content: c.content,
       });
-    });
+    }
   } catch (e) {
     console.error('[浏览器] 获取评论异常:', e.message);
     return { comments: [], error: e.message };
@@ -742,7 +820,7 @@ async function getRecentComments(page, withinMinutes) {
 
 /**
  * 切换到"已下单"标签页获取下单记录，然后切回"全部"
- * 使用同样的 DOM 扫描方式，不依赖 CSS class 名
+ * 使用 TreeWalker 文本节点扫描，匹配 昵称(用户ID) HH:mm 格式
  */
 async function getOrdersFromTab(page, withinMinutes) {
   const cutoff = nowBeijing().subtract(withinMinutes, 'minute');
@@ -752,84 +830,94 @@ async function getOrdersFromTab(page, withinMinutes) {
     await clickCommentTab(page, '已下单');
     console.log('[浏览器] 已切换到"已下单"标签');
 
-    // 在浏览器内扫描并标记下单记录
-    const count = await page.evaluate(() => {
-      document.querySelectorAll('[data-tb-order]').forEach(el => {
-        el.removeAttribute('data-tb-order');
-        el.removeAttribute('data-tb-o-nickname');
-        el.removeAttribute('data-tb-o-userid');
-        el.removeAttribute('data-tb-o-time');
-      });
-
-      const regex = /([^\s\n(]{1,30})(?:\(([^)]+)\))?\s*(\d{1,2}:\d{2}(?::\d{2})?)/;
-      let idx = 0;
+    const rawOrders = await page.evaluate(() => {
+      const results = [];
       const seen = new Set();
+      const headerRegex = /(.+?)\(([^)]+)\)\s+(\d{1,2}:\d{2}(?::\d{2})?)/;
 
-      for (const el of document.querySelectorAll('div, li, p, span')) {
-        const text = el.textContent?.trim();
-        if (!text || text.length > 300) continue;
-        if (el.querySelectorAll('div, li, p, span').length > 15) continue;
+      // TreeWalker 文本节点扫描
+      const walker = document.createTreeWalker(
+        document.body, NodeFilter.SHOW_TEXT, null
+      );
+      while (walker.nextNode()) {
+        const nodeText = walker.currentNode.textContent.trim();
+        if (!nodeText || nodeText.length < 5 || nodeText.length > 200) continue;
 
-        const rect = el.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) continue;
-        if (rect.left > window.innerWidth * 0.5) continue;
-        if (rect.height > 150 || rect.height < 8) continue;
-
-        const match = text.match(regex);
+        const match = nodeText.match(headerRegex);
         if (!match) continue;
 
         const [, nickname, userId, timeStr] = match;
         const hour = parseInt(timeStr.split(':')[0], 10);
         if (hour > 23) continue;
+        if (nickname.includes('AI助理') || nickname.includes('问答助手')) continue;
 
-        if (text.includes('AI助理') || text.includes('问答助手')) continue;
+        const headerEl = walker.currentNode.parentElement;
+        if (!headerEl) continue;
 
-        const key = `${nickname}_${userId || ''}_${timeStr}`;
+        const rect = headerEl.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.left > window.innerWidth * 0.5) continue;
+
+        const key = `${nickname.trim()}_${userId}_${timeStr}`;
         if (seen.has(key)) continue;
         seen.add(key);
 
-        el.setAttribute('data-tb-order', String(idx));
-        el.setAttribute('data-tb-o-nickname', nickname.trim());
-        el.setAttribute('data-tb-o-userid', (userId || nickname).trim());
-        el.setAttribute('data-tb-o-time', timeStr);
-        idx++;
+        results.push({
+          nickname: nickname.trim(),
+          userId: userId.trim(),
+          timeStr,
+        });
       }
 
-      return idx;
+      // 元素级回退
+      if (results.length === 0) {
+        const elemRegex = /(.+?)\(([^)]+)\)\s*(\d{1,2}:\d{2}(?::\d{2})?)/;
+        for (const el of document.querySelectorAll('div, li, p, span')) {
+          const rect = el.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+          if (rect.left > window.innerWidth * 0.5) continue;
+          if (rect.height > 150 || rect.height < 8) continue;
+
+          const text = el.textContent?.trim();
+          if (!text || text.length > 300) continue;
+          if (el.querySelectorAll('div, li, p, span').length > 15) continue;
+
+          const m = text.match(elemRegex);
+          if (!m) continue;
+
+          const [, nick, uid, ts] = m;
+          const h = parseInt(ts.split(':')[0], 10);
+          if (h > 23) continue;
+          if (nick.includes('AI助理') || nick.includes('问答助手')) continue;
+
+          const k = `${nick.trim()}_${uid}_${ts}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+
+          results.push({
+            nickname: nick.trim(),
+            userId: uid.trim(),
+            timeStr: ts,
+          });
+        }
+      }
+
+      return results;
     });
 
-    console.log(`[浏览器] "已下单"标签中找到 ${count} 条记录`);
+    console.log(`[浏览器] "已下单"标签中找到 ${rawOrders.length} 条记录`);
 
-    const taggedElements = await page.$$('[data-tb-order]');
+    for (const o of rawOrders) {
+      const orderTime = parseCommentTime(o.timeStr);
+      if (!orderTime.isValid() || !orderTime.isAfter(cutoff)) continue;
 
-    for (const el of taggedElements) {
-      try {
-        const nickname = await el.getAttribute('data-tb-o-nickname');
-        const userId = await el.getAttribute('data-tb-o-userid');
-        const timeStr = await el.getAttribute('data-tb-o-time');
-
-        const orderTime = parseCommentTime(timeStr);
-        if (!orderTime.isValid() || !orderTime.isAfter(cutoff)) continue;
-
-        orders.push({
-          nickname,
-          userId,
-          time: orderTime.format('YYYY-MM-DD HH:mm:ss'),
-          content: '已下单',
-          element: el,
-        });
-      } catch {}
-    }
-
-    // 清除标记
-    await page.evaluate(() => {
-      document.querySelectorAll('[data-tb-order]').forEach(el => {
-        el.removeAttribute('data-tb-order');
-        el.removeAttribute('data-tb-o-nickname');
-        el.removeAttribute('data-tb-o-userid');
-        el.removeAttribute('data-tb-o-time');
+      orders.push({
+        nickname: o.nickname,
+        userId: o.userId,
+        time: orderTime.format('YYYY-MM-DD HH:mm:ss'),
+        content: '已下单',
       });
-    });
+    }
   } catch (e) {
     console.error('[浏览器] 获取"已下单"标签数据异常:', e.message);
     return { orders: [], error: e.message };
@@ -842,197 +930,199 @@ async function getOrdersFromTab(page, withinMinutes) {
 }
 
 /**
- * 查看订单信息
+ * 打开订单弹窗，从表格中提取所有订单数据
  *
- * 策略：
- * 1. 悬停评论元素，显示隐藏的操作按钮
- * 2. 在评论元素及其祖先容器内查找"查看订单"按钮/链接
- * 3. 对"已下单"类型的评论，尝试直接点击该条目
- * 4. 提取后验证 buyerId 与评论用户匹配
+ * 订单弹窗标题为"订单"，说明文字："仅展示本场直播中下单的全部订单信息"
+ * 表格列：商品标题 | 下单时间 | 支付时间 | 订单ID
+ * 用表格结构提取，不用正则猜。
  */
-async function getOrderInfo(page, comment) {
+async function extractAllOrders(page) {
   try {
-    if (!comment.element) {
-      console.log('[浏览器] 评论元素不可用，跳过订单关联');
-      return null;
-    }
+    // Step 1: 找到并点击订单触发入口（在左侧面板中查找"订单"相关元素）
+    const triggered = await page.evaluate(() => {
+      const candidates = [];
 
-    // 悬停评论元素以显示可能隐藏的操作按钮
-    try {
-      await comment.element.hover();
-      await page.waitForTimeout(800);
-    } catch {}
-
-    // 收集可能包含"查看订单"按钮的容器（从近到远）
-    const containers = [];
-    try {
-      containers.push(comment.element);
-      const directParent = await comment.element.evaluateHandle(el => el.parentElement);
-      if (directParent) containers.push(directParent);
-      const ancestor = await comment.element.evaluateHandle(el =>
-        el.closest('[class*="interact"], [class*="chat"], [class*="comment"], [class*="msg"], [class*="item"], [class*="list"], li, tr')
+      // 用 TreeWalker 查找"订单"文本
+      const walker = document.createTreeWalker(
+        document.body, NodeFilter.SHOW_TEXT, null
       );
-      if (ancestor) containers.push(ancestor);
-    } catch {}
+      while (walker.nextNode()) {
+        const text = walker.currentNode.textContent.trim();
+        if (text === '订单' || text === '查看订单' || text === '订单信息') {
+          const el = walker.currentNode.parentElement;
+          if (!el) continue;
+          const rect = el.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+          if (rect.left > window.innerWidth * 0.5) continue;
+          candidates.push({ el, text, area: rect.width * rect.height });
+        }
+      }
 
-    // "查看订单"及订单相关按钮选择器
-    const orderSelectors = [
-      'text=查看订单',
-      'button:has-text("查看订单")',
-      'a:has-text("查看订单")',
-      'span:has-text("查看订单")',
-      'div:has-text("查看订单")',
-      'text=订单详情',
-      'button:has-text("订单")',
-      'a:has-text("订单")',
-      '[class*="order"]:has-text("查看")',
-      '[class*="order"] svg',
-      '[class*="order"] i',
-      '[class*="order"] img',
-      '[title*="订单"]',
-      '[aria-label*="订单"]',
-      '[class*="clipboard"]',
-    ];
+      // 也搜索带有 title/aria-label 属性的元素
+      for (const el of document.querySelectorAll('[title*="订单"], [aria-label*="订单"]')) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.left > window.innerWidth * 0.5) continue;
+        candidates.push({
+          el,
+          text: el.getAttribute('title') || el.getAttribute('aria-label'),
+          area: rect.width * rect.height,
+        });
+      }
 
-    // 在各层容器内搜索订单入口
-    for (const container of containers) {
-      for (const sel of orderSelectors) {
+      // 点击最小面积的候选（最可能是按钮/图标而非容器）
+      candidates.sort((a, b) => a.area - b.area);
+      for (const c of candidates) {
         try {
-          const btn = await container.$(sel);
-          if (btn) {
-            const visible = await btn.isVisible().catch(() => true);
-            if (!visible) continue;
-            console.log(`[浏览器] 找到订单入口: ${sel}`);
-            await btn.click();
-            await page.waitForTimeout(2000);
-            const orderInfo = await extractOrderFromPopup(page);
-            if (orderInfo) {
-              if (comment.userId && !orderInfo.buyerId) {
-                console.log(`[浏览器] 订单缺少买家ID，跳过`);
-                return null;
-              }
-              if (orderInfo.buyerId && comment.userId && orderInfo.buyerId !== comment.userId) {
-                console.log(`[浏览器] 买家(${orderInfo.buyerId})与评论者(${comment.userId})不匹配，跳过`);
-                return null;
-              }
-              return orderInfo;
-            }
-          }
+          c.el.click();
+          return { clicked: true, text: c.text };
         } catch {}
       }
+      return { clicked: false };
+    });
+
+    if (!triggered.clicked) {
+      console.log('[浏览器] 未找到订单弹窗触发入口');
+      return [];
     }
 
-    // 对"已下单"类型评论，尝试点击条目本身
-    if (comment.content === '已下单' || (comment.content && comment.content.includes('已下单'))) {
-      try {
-        await comment.element.click();
-        await page.waitForTimeout(2000);
-        const orderInfo = await extractOrderFromPopup(page);
-        if (orderInfo) return orderInfo;
-      } catch {}
+    console.log(`[浏览器] 点击了订单入口: "${triggered.text}"`);
+    await page.waitForTimeout(2000);
 
-      // 尝试找到"已下单"文本元素并点击
-      try {
-        const orderLabel = await comment.element.$(':text("已下单")');
-        if (orderLabel) {
-          await orderLabel.click();
-          await page.waitForTimeout(2000);
-          const orderInfo = await extractOrderFromPopup(page);
-          if (orderInfo) return orderInfo;
+    // Step 2: 从弹窗中提取订单表格数据
+    const orders = await page.evaluate(() => {
+      const results = [];
+
+      // 查找包含"订单"标题的对话框
+      const dialogSelectors = [
+        '[role="dialog"]',
+        '[class*="modal"]',
+        '[class*="dialog"]',
+        '[class*="popup"]',
+        '[class*="drawer"]',
+        '[class*="overlay"]',
+      ];
+
+      let dialog = null;
+      for (const sel of dialogSelectors) {
+        for (const el of document.querySelectorAll(sel)) {
+          const text = el.textContent || '';
+          if (text.includes('仅展示本场直播') ||
+              (text.includes('订单') && el.getBoundingClientRect().height > 200)) {
+            dialog = el;
+            break;
+          }
         }
-      } catch {}
-    }
-
-    console.log(`[浏览器] 未找到订单入口: ${comment.nickname}`);
-  } catch (e) {
-    console.error('[浏览器] 查看订单异常:', e.message);
-  }
-
-  return null;
-}
-
-/**
- * 从弹窗提取订单信息
- */
-async function extractOrderFromPopup(page) {
-  try {
-    const dialogSelectors = [
-      '[class*="modal"]',
-      '[class*="dialog"]',
-      '[class*="popup"]',
-      '[class*="drawer"]',
-      '[role="dialog"]',
-    ];
-
-    let dialog = null;
-    for (const sel of dialogSelectors) {
-      dialog = await page.$(sel);
-      if (dialog) break;
-    }
-
-    if (!dialog) {
-      console.log('[浏览器] 未找到订单弹窗');
-      return null;
-    }
-
-    const dialogText = await dialog.textContent();
-    if (!dialogText) return null;
-
-    let orderId = '';
-    const orderMatch = dialogText.match(/订单(?:编号|号|[Ii][Dd])?\s*[：:]\s*(\d+)/);
-    if (orderMatch) {
-      orderId = orderMatch[1];
-    } else {
-      const longNumMatch = dialogText.match(/\b(\d{15,20})\b/);
-      if (longNumMatch) {
-        orderId = longNumMatch[1];
+        if (dialog) break;
       }
-    }
 
-    let paymentTime = '';
-    const timeMatch = dialogText.match(
-      /(?:支付|付款|下单|创建)[时日]?\s*[间期]?\s*[：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?)/
-    );
-    if (timeMatch) {
-      paymentTime = timeMatch[1].replace(/\//g, '-');
-    }
+      // 回退：查找 fixed/absolute 定位的大块弹窗元素
+      if (!dialog) {
+        for (const el of document.querySelectorAll('div')) {
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          if (rect.height > 200 && rect.width > 300 &&
+              (style.position === 'fixed' || style.position === 'absolute') &&
+              el.textContent.includes('订单')) {
+            dialog = el;
+            break;
+          }
+        }
+      }
 
-    const buyerMatch = dialogText.match(/买[家者]?\s*[：:]\s*([^\s,，]+)/);
-    const buyerId = buyerMatch ? buyerMatch[1] : '';
+      if (!dialog) return results;
 
+      // Strategy 1: 真正的 <table> 元素
+      const table = dialog.querySelector('table');
+      if (table) {
+        const trs = table.querySelectorAll('tr');
+        for (let i = 1; i < trs.length; i++) {
+          const cells = trs[i].querySelectorAll('td, th');
+          if (cells.length >= 4) {
+            results.push({
+              productTitle: cells[0].textContent.trim(),
+              orderTime: cells[1].textContent.trim().replace(/\//g, '-'),
+              paymentTime: cells[2].textContent.trim().replace(/\//g, '-'),
+              orderId: cells[3].textContent.trim(),
+            });
+          }
+        }
+        if (results.length > 0) return results;
+      }
+
+      // Strategy 2: div-based 表格（React/Vue 常见结构）
+      const headerTexts = ['商品标题', '下单时间', '支付时间', '订单'];
+      let headerRow = null;
+      for (const el of dialog.querySelectorAll('div, tr, thead')) {
+        const text = el.textContent || '';
+        const matchCount = headerTexts.filter(h => text.includes(h)).length;
+        if (matchCount >= 3 && el.getBoundingClientRect().height < 80) {
+          headerRow = el;
+          break;
+        }
+      }
+
+      if (headerRow) {
+        const dataContainer = headerRow.parentElement;
+        if (dataContainer) {
+          for (const row of dataContainer.querySelectorAll('div, tr')) {
+            if (row === headerRow || row.contains(headerRow) || headerRow.contains(row)) continue;
+            const rowText = row.textContent || '';
+            const orderIdMatch = rowText.match(/(\d{15,25})/);
+            if (!orderIdMatch) continue;
+
+            const times = rowText.match(/\d{4}\/\d{1,2}\/\d{1,2}\s+\d{1,2}:\d{2}:\d{2}/g) || [];
+            results.push({
+              productTitle: '',
+              orderTime: times[0] ? times[0].replace(/\//g, '-') : '',
+              paymentTime: times[1] ? times[1].replace(/\//g, '-') : (times[0] ? times[0].replace(/\//g, '-') : ''),
+              orderId: orderIdMatch[1],
+            });
+          }
+        }
+      }
+
+      // Strategy 3: 从整个弹窗文本中提取订单ID和时间
+      if (results.length === 0) {
+        const dialogText = dialog.textContent || '';
+        const orderIds = dialogText.match(/\d{15,25}/g) || [];
+        const times = dialogText.match(/\d{4}\/\d{1,2}\/\d{1,2}\s+\d{1,2}:\d{2}:\d{2}/g) || [];
+
+        for (let i = 0; i < orderIds.length; i++) {
+          results.push({
+            productTitle: '',
+            orderTime: times[i * 2] ? times[i * 2].replace(/\//g, '-') : '',
+            paymentTime: times[i * 2 + 1] ? times[i * 2 + 1].replace(/\//g, '-') : '',
+            orderId: orderIds[i],
+          });
+        }
+      }
+
+      return results;
+    });
+
+    // Step 3: 关闭弹窗
     try {
-      const closeBtn = await dialog.$('[class*="close"], button:has-text("关闭"), button:has-text("×")');
-      if (closeBtn) {
-        await closeBtn.click();
-        await page.waitForTimeout(500);
-      } else {
-        await page.keyboard.press('Escape');
-        await page.waitForTimeout(500);
-      }
-    } catch {
       await page.keyboard.press('Escape');
-    }
+      await page.waitForTimeout(500);
+    } catch {}
 
-    if (!orderId && !paymentTime) {
-      console.log('[浏览器] 订单弹窗中未找到有效数据');
-      return null;
-    }
-
-    console.log(`[浏览器] 提取到订单ID: ${orderId}, 支付时间: ${paymentTime}`);
-    return { orderId, paymentTime, buyerId };
+    console.log(`[浏览器] 从订单弹窗提取到 ${orders.length} 条订单`);
+    return orders;
   } catch (e) {
-    console.error('[浏览器] 提取订单信息异常:', e.message);
+    console.error('[浏览器] 提取订单异常:', e.message);
     try { await page.keyboard.press('Escape'); } catch {}
-    return null;
+    return [];
   }
 }
 
 module.exports = {
   launchBrowser,
   enterLiveRoom,
+  dumpPageDOM,
   getTransactionCount,
   getRecentComments,
   getOrdersFromTab,
-  getOrderInfo,
+  extractAllOrders,
   nowBeijing,
 };
