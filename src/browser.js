@@ -563,63 +563,174 @@ async function getTransactionCount(page) {
 }
 
 /**
+ * 在评论区（左侧面板）中点击指定标签
+ * 用页面位置判断避免误点右侧商品区的同名元素（如"全部商品"）
+ */
+async function clickCommentTab(page, tabText) {
+  try {
+    const clicked = await page.evaluate((text) => {
+      for (const el of document.querySelectorAll('div, span, a, button, li, label')) {
+        if (el.children.length > 5) continue;
+        const ownText = el.textContent?.trim();
+        if (ownText !== text) continue;
+
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.left > window.innerWidth * 0.5) continue;
+        if (rect.width > 200 || rect.height > 60) continue;
+
+        el.click();
+        return true;
+      }
+      return false;
+    }, tabText);
+
+    if (clicked) {
+      await page.waitForTimeout(1000);
+    } else {
+      console.log(`[浏览器] 未找到评论区"${tabText}"标签`);
+    }
+  } catch (e) {
+    console.log(`[浏览器] 点击"${tabText}"标签失败:`, e.message);
+  }
+}
+
+/**
+ * 解析时间字符串，自动处理 HH:mm 和 HH:mm:ss 两种格式
+ */
+function parseCommentTime(timeStr) {
+  const now = nowBeijing();
+  const today = now.format('YYYY-MM-DD');
+  const hasSeconds = timeStr.split(':').length === 3;
+  const fmt = hasSeconds ? 'YYYY-MM-DD HH:mm:ss' : 'YYYY-MM-DD HH:mm';
+  let t = dayjs.tz(`${today} ${timeStr}`, fmt, BEIJING_TZ);
+  if (!t.isValid()) {
+    t = dayjs.tz(`${today} ${timeStr}:00`, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+  }
+  if (t.diff(now, 'hour') >= 1) {
+    t = t.subtract(1, 'day');
+  }
+  return t;
+}
+
+/**
  * 获取近期评论
- * @returns {{ comments: Array, error: string|null }} 返回结构化结果，error 非 null 表示采集异常
+ *
+ * 不依赖特定 CSS class 名（淘宝使用 hash/混淆类名），
+ * 而是通过文本模式匹配 + 页面位置（左侧面板）来识别评论元素。
+ * 分两阶段：先在浏览器内标记匹配元素，再获取 element handle。
  */
 async function getRecentComments(page, withinMinutes) {
   const cutoff = nowBeijing().subtract(withinMinutes, 'minute');
   console.log(`[浏览器] 获取 ${cutoff.format('HH:mm:ss')} 之后的评论...`);
 
+  await clickCommentTab(page, '全部');
+
   const comments = [];
 
   try {
-    const allTab = await page.$('text=全部');
-    if (allTab) {
-      await allTab.click();
-      await page.waitForTimeout(1000);
-    }
-  } catch {
-    // tab 切换失败不影响采集
-  }
+    // Phase 1: 在浏览器内扫描 DOM，标记匹配评论模式的元素
+    const diagnostics = await page.evaluate(() => {
+      // 清除旧标记
+      document.querySelectorAll('[data-tb-idx]').forEach(el => {
+        el.removeAttribute('data-tb-idx');
+        el.removeAttribute('data-tb-nickname');
+        el.removeAttribute('data-tb-userid');
+        el.removeAttribute('data-tb-time');
+        el.removeAttribute('data-tb-content');
+      });
 
-  try {
-    const commentElements = await page.$$('[class*="comment"], [class*="message"], [class*="chat"], [class*="interact"]');
+      // 评论模式: 昵称[(用户ID)] [空白] HH:MM[:SS] [换行/空白] 内容
+      const regex = /([^\s\n(]{1,30})(?:\(([^)]+)\))?\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*([\s\S]+)/;
+      let idx = 0;
+      const seen = new Set();
+      const diag = { total: 0, leftPanel: 0, sizeOk: 0, matched: 0, tagged: 0 };
 
-    const elements = commentElements.length > 0
-      ? commentElements
-      : await page.$$('li, [class*="item"]');
+      for (const el of document.querySelectorAll('div, li, p, article, section, span')) {
+        diag.total++;
 
-    for (const el of elements) {
-      const text = await el.textContent();
-      if (!text) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        // 评论区在页面左侧
+        if (rect.left > window.innerWidth * 0.5) continue;
+        diag.leftPanel++;
 
-      const commentMatch = text.match(
-        /([^\s(]+)(?:\(([^)]+)\))?\s+(\d{1,2}:\d{2}(?::\d{2})?)\s+(.+)/
-      );
+        if (rect.height > 200 || rect.height < 8) continue;
+        diag.sizeOk++;
 
-      if (commentMatch) {
-        const [, nickname, userId, timeStr, content] = commentMatch;
-        const now = nowBeijing();
-        const today = now.format('YYYY-MM-DD');
-        const fullTimeStr = `${today} ${timeStr}`;
-        let commentTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+        const text = el.textContent?.trim();
+        if (!text || text.length < 3 || text.length > 500) continue;
+        // 跳过包含大量子元素的容器
+        if (el.querySelectorAll('div, li, p, span').length > 20) continue;
 
-        // 跨午夜修正
-        if (commentTime.diff(now, 'hour') >= 1) {
-          commentTime = commentTime.subtract(1, 'day');
-        }
+        const match = text.match(regex);
+        if (!match) continue;
+        diag.matched++;
 
-        if (commentTime.isAfter(cutoff)) {
-          comments.push({
-            nickname: nickname?.trim() || '',
-            userId: userId?.trim() || nickname?.trim() || '',
-            time: commentTime.format('YYYY-MM-DD HH:mm:ss'),
-            content: content?.trim() || '',
-            element: el,
-          });
-        }
+        const [, nickname, userId, timeStr, rawContent] = match;
+        const hour = parseInt(timeStr.split(':')[0], 10);
+        if (hour > 23) continue;
+
+        const content = rawContent.trim().split(/[\n\r]+/)[0]?.trim() || '';
+        if (!content) continue;
+
+        // 跳过 AI/系统消息
+        if (text.includes('AI助理') || text.includes('问答助手')) continue;
+        if (content.startsWith('私密回复')) continue;
+
+        const key = `${nickname}_${userId || ''}_${timeStr}_${content}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        el.setAttribute('data-tb-idx', String(idx));
+        el.setAttribute('data-tb-nickname', nickname.trim());
+        el.setAttribute('data-tb-userid', (userId || nickname).trim());
+        el.setAttribute('data-tb-time', timeStr);
+        el.setAttribute('data-tb-content', content);
+        idx++;
+        diag.tagged++;
       }
+
+      return diag;
+    });
+
+    console.log(
+      `[浏览器] 评论扫描: 总${diagnostics.total} → 左侧${diagnostics.leftPanel} → 尺寸${diagnostics.sizeOk} → 模式匹配${diagnostics.matched} → 标记${diagnostics.tagged}`
+    );
+
+    // Phase 2: 获取标记元素的 handles
+    const taggedElements = await page.$$('[data-tb-idx]');
+
+    for (const el of taggedElements) {
+      try {
+        const nickname = await el.getAttribute('data-tb-nickname');
+        const userId = await el.getAttribute('data-tb-userid');
+        const timeStr = await el.getAttribute('data-tb-time');
+        const content = await el.getAttribute('data-tb-content');
+
+        const commentTime = parseCommentTime(timeStr);
+        if (!commentTime.isValid() || !commentTime.isAfter(cutoff)) continue;
+
+        comments.push({
+          nickname,
+          userId,
+          time: commentTime.format('YYYY-MM-DD HH:mm:ss'),
+          content,
+          element: el,
+        });
+      } catch {}
     }
+
+    // Phase 3: 清除标记
+    await page.evaluate(() => {
+      document.querySelectorAll('[data-tb-idx]').forEach(el => {
+        el.removeAttribute('data-tb-idx');
+        el.removeAttribute('data-tb-nickname');
+        el.removeAttribute('data-tb-userid');
+        el.removeAttribute('data-tb-time');
+        el.removeAttribute('data-tb-content');
+      });
+    });
   } catch (e) {
     console.error('[浏览器] 获取评论异常:', e.message);
     return { comments: [], error: e.message };
@@ -631,73 +742,102 @@ async function getRecentComments(page, withinMinutes) {
 
 /**
  * 切换到"已下单"标签页获取下单记录，然后切回"全部"
- * 这是获取订单数据的主要途径：评论区的"已下单"tab 会列出所有下单用户
+ * 使用同样的 DOM 扫描方式，不依赖 CSS class 名
  */
 async function getOrdersFromTab(page, withinMinutes) {
   const cutoff = nowBeijing().subtract(withinMinutes, 'minute');
   const orders = [];
 
   try {
-    // 点击"已下单"标签
-    const orderTab = await page.$('text=已下单');
-    if (!orderTab) {
-      console.log('[浏览器] 未找到"已下单"标签');
-      return { orders: [], error: null };
-    }
-
-    await orderTab.click();
-    await page.waitForTimeout(1500);
+    await clickCommentTab(page, '已下单');
     console.log('[浏览器] 已切换到"已下单"标签');
 
-    // 获取"已下单"视图中的条目
-    const elements = await page.$$('[class*="comment"], [class*="message"], [class*="chat"], [class*="interact"], [class*="item"], li');
+    // 在浏览器内扫描并标记下单记录
+    const count = await page.evaluate(() => {
+      document.querySelectorAll('[data-tb-order]').forEach(el => {
+        el.removeAttribute('data-tb-order');
+        el.removeAttribute('data-tb-o-nickname');
+        el.removeAttribute('data-tb-o-userid');
+        el.removeAttribute('data-tb-o-time');
+      });
 
-    for (const el of elements) {
-      try {
-        const text = await el.textContent();
-        if (!text || !text.includes('已下单')) continue;
+      const regex = /([^\s\n(]{1,30})(?:\(([^)]+)\))?\s*(\d{1,2}:\d{2}(?::\d{2})?)/;
+      let idx = 0;
+      const seen = new Set();
 
-        // 解析用户名和时间
-        const match = text.match(/([^\s(]+)(?:\(([^)]+)\))?\s+(\d{1,2}:\d{2}(?::\d{2})?)/);
+      for (const el of document.querySelectorAll('div, li, p, span')) {
+        const text = el.textContent?.trim();
+        if (!text || text.length > 300) continue;
+        if (el.querySelectorAll('div, li, p, span').length > 15) continue;
+
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.left > window.innerWidth * 0.5) continue;
+        if (rect.height > 150 || rect.height < 8) continue;
+
+        const match = text.match(regex);
         if (!match) continue;
 
         const [, nickname, userId, timeStr] = match;
-        const now = nowBeijing();
-        const today = now.format('YYYY-MM-DD');
-        const fullTimeStr = `${today} ${timeStr}`;
-        let orderTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+        const hour = parseInt(timeStr.split(':')[0], 10);
+        if (hour > 23) continue;
 
-        if (orderTime.diff(now, 'hour') >= 1) {
-          orderTime = orderTime.subtract(1, 'day');
-        }
+        if (text.includes('AI助理') || text.includes('问答助手')) continue;
 
-        if (orderTime.isAfter(cutoff)) {
-          orders.push({
-            nickname: nickname?.trim() || '',
-            userId: userId?.trim() || nickname?.trim() || '',
-            time: orderTime.format('YYYY-MM-DD HH:mm:ss'),
-            content: '已下单',
-            element: el,
-          });
-        }
+        const key = `${nickname}_${userId || ''}_${timeStr}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        el.setAttribute('data-tb-order', String(idx));
+        el.setAttribute('data-tb-o-nickname', nickname.trim());
+        el.setAttribute('data-tb-o-userid', (userId || nickname).trim());
+        el.setAttribute('data-tb-o-time', timeStr);
+        idx++;
+      }
+
+      return idx;
+    });
+
+    console.log(`[浏览器] "已下单"标签中找到 ${count} 条记录`);
+
+    const taggedElements = await page.$$('[data-tb-order]');
+
+    for (const el of taggedElements) {
+      try {
+        const nickname = await el.getAttribute('data-tb-o-nickname');
+        const userId = await el.getAttribute('data-tb-o-userid');
+        const timeStr = await el.getAttribute('data-tb-o-time');
+
+        const orderTime = parseCommentTime(timeStr);
+        if (!orderTime.isValid() || !orderTime.isAfter(cutoff)) continue;
+
+        orders.push({
+          nickname,
+          userId,
+          time: orderTime.format('YYYY-MM-DD HH:mm:ss'),
+          content: '已下单',
+          element: el,
+        });
       } catch {}
     }
 
-    console.log(`[浏览器] "已下单"标签中获取到 ${orders.length} 条记录`);
+    // 清除标记
+    await page.evaluate(() => {
+      document.querySelectorAll('[data-tb-order]').forEach(el => {
+        el.removeAttribute('data-tb-order');
+        el.removeAttribute('data-tb-o-nickname');
+        el.removeAttribute('data-tb-o-userid');
+        el.removeAttribute('data-tb-o-time');
+      });
+    });
   } catch (e) {
     console.error('[浏览器] 获取"已下单"标签数据异常:', e.message);
     return { orders: [], error: e.message };
   } finally {
-    // 切回"全部"标签
-    try {
-      const allTab = await page.$('text=全部');
-      if (allTab) {
-        await allTab.click();
-        await page.waitForTimeout(1000);
-      }
-    } catch {}
+    await clickCommentTab(page, '全部');
   }
 
+  console.log(`[浏览器] "已下单"标签获取到 ${orders.length} 条记录`);
   return { orders, error: null };
 }
 
