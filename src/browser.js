@@ -929,186 +929,362 @@ async function getOrdersFromTab(page, withinMinutes) {
   return { orders, error: null };
 }
 
+
+
 /**
- * 打开订单弹窗，从表格中提取所有订单数据
+ * 从弹出的订单对话框/面板中提取订单数据
+ * 支持三种策略：真实 <table>、div-based 表格、正则兜底
+ */
+async function extractOrdersFromPopup(page) {
+  return page.evaluate(() => {
+    const results = [];
+
+    // 查找包含订单信息的对话框/面板
+    const dialogSelectors = [
+      '[role="dialog"]',
+      '[class*="modal"]',
+      '[class*="dialog"]',
+      '[class*="popup"]',
+      '[class*="drawer"]',
+      '[class*="overlay"]',
+      '[class*="popover"]',
+      '[class*="tooltip"]',
+    ];
+
+    let dialog = null;
+    for (const sel of dialogSelectors) {
+      for (const el of document.querySelectorAll(sel)) {
+        const text = el.textContent || '';
+        if (text.includes('仅展示本场直播') ||
+            (text.includes('订单') && el.getBoundingClientRect().height > 100)) {
+          dialog = el;
+          break;
+        }
+      }
+      if (dialog) break;
+    }
+
+    // 回退：查找 fixed/absolute 定位的弹出元素
+    if (!dialog) {
+      for (const el of document.querySelectorAll('div')) {
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        if (rect.height > 100 && rect.width > 200 &&
+            (style.position === 'fixed' || style.position === 'absolute') &&
+            style.zIndex && parseInt(style.zIndex) > 10 &&
+            el.textContent.includes('订单')) {
+          dialog = el;
+          break;
+        }
+      }
+    }
+
+    // 再回退：查找最近出现的、包含订单ID格式数字的浮动元素
+    if (!dialog) {
+      for (const el of document.querySelectorAll('div')) {
+        const rect = el.getBoundingClientRect();
+        if (rect.height < 50 || rect.width < 150) continue;
+        const style = window.getComputedStyle(el);
+        if (style.position !== 'fixed' && style.position !== 'absolute') continue;
+        const text = el.textContent || '';
+        if (/\d{15,25}/.test(text)) {
+          dialog = el;
+          break;
+        }
+      }
+    }
+
+    if (!dialog) return results;
+
+    // Strategy 1: 真正的 <table> 元素
+    const table = dialog.querySelector('table');
+    if (table) {
+      const trs = table.querySelectorAll('tr');
+      for (let i = 1; i < trs.length; i++) {
+        const cells = trs[i].querySelectorAll('td, th');
+        if (cells.length >= 4) {
+          results.push({
+            productTitle: cells[0].textContent.trim(),
+            orderTime: cells[1].textContent.trim().replace(/\//g, '-'),
+            paymentTime: cells[2].textContent.trim().replace(/\//g, '-'),
+            orderId: cells[3].textContent.trim(),
+          });
+        }
+      }
+      if (results.length > 0) return results;
+    }
+
+    // Strategy 2: div-based 表格
+    const headerTexts = ['商品标题', '下单时间', '支付时间', '订单'];
+    let headerRow = null;
+    for (const el of dialog.querySelectorAll('div, tr, thead')) {
+      const text = el.textContent || '';
+      const matchCount = headerTexts.filter(h => text.includes(h)).length;
+      if (matchCount >= 3 && el.getBoundingClientRect().height < 80) {
+        headerRow = el;
+        break;
+      }
+    }
+
+    if (headerRow) {
+      const dataContainer = headerRow.parentElement;
+      if (dataContainer) {
+        for (const row of dataContainer.querySelectorAll('div, tr')) {
+          if (row === headerRow || row.contains(headerRow) || headerRow.contains(row)) continue;
+          const rowText = row.textContent || '';
+          const orderIdMatch = rowText.match(/(\d{15,25})/);
+          if (!orderIdMatch) continue;
+
+          const times = rowText.match(/\d{4}\/\d{1,2}\/\d{1,2}\s+\d{1,2}:\d{2}:\d{2}/g) || [];
+          results.push({
+            productTitle: '',
+            orderTime: times[0] ? times[0].replace(/\//g, '-') : '',
+            paymentTime: times[1] ? times[1].replace(/\//g, '-') : (times[0] ? times[0].replace(/\//g, '-') : ''),
+            orderId: orderIdMatch[1],
+          });
+        }
+      }
+    }
+
+    // Strategy 3: 纯文本提取
+    if (results.length === 0) {
+      const dialogText = dialog.textContent || '';
+      const orderIds = dialogText.match(/\d{15,25}/g) || [];
+      const times = dialogText.match(/\d{4}\/\d{1,2}\/\d{1,2}\s+\d{1,2}:\d{2}:\d{2}/g) || [];
+
+      for (let i = 0; i < orderIds.length; i++) {
+        results.push({
+          productTitle: '',
+          orderTime: times[i * 2] ? times[i * 2].replace(/\//g, '-') : '',
+          paymentTime: times[i * 2 + 1] ? times[i * 2 + 1].replace(/\//g, '-') : '',
+          orderId: orderIds[i],
+        });
+      }
+    }
+
+    return results;
+  });
+}
+
+/**
+ * 从"全部"标签中找到"查看订单"入口并提取订单数据
  *
- * 订单弹窗标题为"订单"，说明文字："仅展示本场直播中下单的全部订单信息"
- * 表格列：商品标题 | 下单时间 | 支付时间 | 订单ID
- * 用表格结构提取，不用正则猜。
+ * 用户反馈：需要在"全部"标签的评论数据右侧找到"查看订单"按钮。
+ * 策略：
+ *   1. 直接搜索页面上可见的"查看订单"（不限制左右位置）
+ *   2. 悬停"已下单"评论条目，在其右侧查找悬停后出现的"查看订单"
+ *   3. 点击后从弹出的订单详情中提取数据
  */
 async function extractAllOrders(page) {
   try {
-    // Step 1: 找到并点击订单触发入口（在左侧面板中查找"订单"相关元素）
-    const triggered = await page.evaluate(() => {
+    // 确保在"全部"标签（用户说"查看订单"在全部数据的评论右侧）
+    await clickCommentTab(page, '全部');
+    await page.waitForTimeout(500);
+
+    // ── 第1步：直接搜索"查看订单"（不过滤位置——按钮在评论数据右侧）──
+    const directBtn = await page.evaluate(() => {
+      const keywords = ['查看订单', '查看全部订单', '订单详情'];
       const candidates = [];
 
-      // 用 TreeWalker 查找"订单"文本
-      const walker = document.createTreeWalker(
-        document.body, NodeFilter.SHOW_TEXT, null
-      );
+      // TreeWalker 搜索文本
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
       while (walker.nextNode()) {
         const text = walker.currentNode.textContent.trim();
-        if (text === '订单' || text === '查看订单' || text === '订单信息') {
-          const el = walker.currentNode.parentElement;
-          if (!el) continue;
-          const rect = el.getBoundingClientRect();
-          if (rect.width === 0 || rect.height === 0) continue;
-          if (rect.left > window.innerWidth * 0.5) continue;
-          candidates.push({ el, text, area: rect.width * rect.height });
-        }
-      }
-
-      // 也搜索带有 title/aria-label 属性的元素
-      for (const el of document.querySelectorAll('[title*="订单"], [aria-label*="订单"]')) {
+        if (!keywords.includes(text)) continue;
+        const el = walker.currentNode.parentElement;
+        if (!el) continue;
         const rect = el.getBoundingClientRect();
         if (rect.width === 0 || rect.height === 0) continue;
-        if (rect.left > window.innerWidth * 0.5) continue;
+        if (rect.width > 500 || rect.height > 100) continue;
         candidates.push({
-          el,
-          text: el.getAttribute('title') || el.getAttribute('aria-label'),
+          x: rect.x + rect.width / 2,
+          y: rect.y + rect.height / 2,
+          text,
           area: rect.width * rect.height,
         });
       }
 
-      // 点击最小面积的候选（最可能是按钮/图标而非容器）
-      candidates.sort((a, b) => a.area - b.area);
-      for (const c of candidates) {
-        try {
-          c.el.click();
-          return { clicked: true, text: c.text };
-        } catch {}
-      }
-      return { clicked: false };
-    });
-
-    if (!triggered.clicked) {
-      console.log('[浏览器] 未找到订单弹窗触发入口');
-      return [];
-    }
-
-    console.log(`[浏览器] 点击了订单入口: "${triggered.text}"`);
-    await page.waitForTimeout(2000);
-
-    // Step 2: 从弹窗中提取订单表格数据
-    const orders = await page.evaluate(() => {
-      const results = [];
-
-      // 查找包含"订单"标题的对话框
-      const dialogSelectors = [
-        '[role="dialog"]',
-        '[class*="modal"]',
-        '[class*="dialog"]',
-        '[class*="popup"]',
-        '[class*="drawer"]',
-        '[class*="overlay"]',
-      ];
-
-      let dialog = null;
-      for (const sel of dialogSelectors) {
-        for (const el of document.querySelectorAll(sel)) {
-          const text = el.textContent || '';
-          if (text.includes('仅展示本场直播') ||
-              (text.includes('订单') && el.getBoundingClientRect().height > 200)) {
-            dialog = el;
-            break;
-          }
-        }
-        if (dialog) break;
-      }
-
-      // 回退：查找 fixed/absolute 定位的大块弹窗元素
-      if (!dialog) {
-        for (const el of document.querySelectorAll('div')) {
-          const rect = el.getBoundingClientRect();
-          const style = window.getComputedStyle(el);
-          if (rect.height > 200 && rect.width > 300 &&
-              (style.position === 'fixed' || style.position === 'absolute') &&
-              el.textContent.includes('订单')) {
-            dialog = el;
-            break;
-          }
-        }
-      }
-
-      if (!dialog) return results;
-
-      // Strategy 1: 真正的 <table> 元素
-      const table = dialog.querySelector('table');
-      if (table) {
-        const trs = table.querySelectorAll('tr');
-        for (let i = 1; i < trs.length; i++) {
-          const cells = trs[i].querySelectorAll('td, th');
-          if (cells.length >= 4) {
-            results.push({
-              productTitle: cells[0].textContent.trim(),
-              orderTime: cells[1].textContent.trim().replace(/\//g, '-'),
-              paymentTime: cells[2].textContent.trim().replace(/\//g, '-'),
-              orderId: cells[3].textContent.trim(),
-            });
-          }
-        }
-        if (results.length > 0) return results;
-      }
-
-      // Strategy 2: div-based 表格（React/Vue 常见结构）
-      const headerTexts = ['商品标题', '下单时间', '支付时间', '订单'];
-      let headerRow = null;
-      for (const el of dialog.querySelectorAll('div, tr, thead')) {
-        const text = el.textContent || '';
-        const matchCount = headerTexts.filter(h => text.includes(h)).length;
-        if (matchCount >= 3 && el.getBoundingClientRect().height < 80) {
-          headerRow = el;
-          break;
-        }
-      }
-
-      if (headerRow) {
-        const dataContainer = headerRow.parentElement;
-        if (dataContainer) {
-          for (const row of dataContainer.querySelectorAll('div, tr')) {
-            if (row === headerRow || row.contains(headerRow) || headerRow.contains(row)) continue;
-            const rowText = row.textContent || '';
-            const orderIdMatch = rowText.match(/(\d{15,25})/);
-            if (!orderIdMatch) continue;
-
-            const times = rowText.match(/\d{4}\/\d{1,2}\/\d{1,2}\s+\d{1,2}:\d{2}:\d{2}/g) || [];
-            results.push({
-              productTitle: '',
-              orderTime: times[0] ? times[0].replace(/\//g, '-') : '',
-              paymentTime: times[1] ? times[1].replace(/\//g, '-') : (times[0] ? times[0].replace(/\//g, '-') : ''),
-              orderId: orderIdMatch[1],
-            });
-          }
-        }
-      }
-
-      // Strategy 3: 从整个弹窗文本中提取订单ID和时间
-      if (results.length === 0) {
-        const dialogText = dialog.textContent || '';
-        const orderIds = dialogText.match(/\d{15,25}/g) || [];
-        const times = dialogText.match(/\d{4}\/\d{1,2}\/\d{1,2}\s+\d{1,2}:\d{2}:\d{2}/g) || [];
-
-        for (let i = 0; i < orderIds.length; i++) {
-          results.push({
-            productTitle: '',
-            orderTime: times[i * 2] ? times[i * 2].replace(/\//g, '-') : '',
-            paymentTime: times[i * 2 + 1] ? times[i * 2 + 1].replace(/\//g, '-') : '',
-            orderId: orderIds[i],
+      // 搜索 title/aria-label 属性
+      for (const el of document.querySelectorAll('[title*="查看订单"], [aria-label*="查看订单"], [title*="订单"], [aria-label*="订单"]')) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.width > 300 || rect.height > 80) continue;
+        const attrText = el.getAttribute('title') || el.getAttribute('aria-label') || '';
+        if (!candidates.some(c => Math.abs(c.x - (rect.x + rect.width / 2)) < 5 &&
+                                   Math.abs(c.y - (rect.y + rect.height / 2)) < 5)) {
+          candidates.push({
+            x: rect.x + rect.width / 2,
+            y: rect.y + rect.height / 2,
+            text: attrText,
+            area: rect.width * rect.height,
           });
         }
       }
 
-      return results;
+      // 搜索小型可点击元素中包含"订单"的（按钮、链接、图标）
+      for (const el of document.querySelectorAll('a, button, [role="button"], svg')) {
+        const text = el.textContent?.trim() || el.getAttribute('title') || '';
+        if (!text.includes('订单')) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.width > 200 || rect.height > 60) continue;
+        if (!candidates.some(c => Math.abs(c.x - (rect.x + rect.width / 2)) < 5 &&
+                                   Math.abs(c.y - (rect.y + rect.height / 2)) < 5)) {
+          candidates.push({
+            x: rect.x + rect.width / 2,
+            y: rect.y + rect.height / 2,
+            text,
+            area: rect.width * rect.height,
+          });
+        }
+      }
+
+      candidates.sort((a, b) => a.area - b.area);
+      return candidates.length > 0 ? candidates[0] : null;
     });
 
-    // Step 3: 关闭弹窗
-    try {
-      await page.keyboard.press('Escape');
-      await page.waitForTimeout(500);
-    } catch {}
+    if (directBtn) {
+      console.log(`[浏览器] 找到订单入口: "${directBtn.text}" (${directBtn.x.toFixed(0)}, ${directBtn.y.toFixed(0)})`);
+      await page.mouse.click(directBtn.x, directBtn.y);
+      await page.waitForTimeout(2000);
 
-    console.log(`[浏览器] 从订单弹窗提取到 ${orders.length} 条订单`);
-    return orders;
+      const orders = await extractOrdersFromPopup(page);
+      try { await page.keyboard.press('Escape'); await page.waitForTimeout(500); } catch {}
+
+      if (orders.length > 0) {
+        console.log(`[浏览器] 从订单弹窗提取到 ${orders.length} 条订单`);
+        return orders;
+      }
+      console.log('[浏览器] 点击后未能提取到订单数据，尝试悬停方式...');
+    }
+
+    // ── 第2步：悬停"已下单"条目，在其右侧寻找"查看订单" ──
+    console.log('[浏览器] 查找"已下单"条目进行悬停...');
+
+    const entryPositions = await page.evaluate(() => {
+      const positions = [];
+      const seen = new Set();
+
+      // 用 TreeWalker 找"已下单"文本
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+      while (walker.nextNode()) {
+        const text = walker.currentNode.textContent.trim();
+        if (text !== '已下单') continue;
+        const el = walker.currentNode.parentElement;
+        if (!el) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+
+        // 向上找条目容器（高度30-120px的父元素）
+        let container = el;
+        for (let i = 0; i < 5; i++) {
+          if (!container.parentElement) break;
+          const pr = container.parentElement.getBoundingClientRect();
+          if (pr.height >= 30 && pr.height <= 150 && pr.width > 100) {
+            container = container.parentElement;
+          } else if (pr.height > 150) {
+            break;
+          }
+        }
+
+        const cr = container.getBoundingClientRect();
+        const key = `${Math.round(cr.y)}_${Math.round(cr.x)}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        positions.push({
+          centerX: cr.x + cr.width / 2,
+          centerY: cr.y + cr.height / 2,
+          rightX: cr.right - 20,
+          top: cr.top,
+          bottom: cr.bottom,
+        });
+      }
+
+      return positions;
+    });
+
+    console.log(`[浏览器] 找到 ${entryPositions.length} 个"已下单"条目`);
+
+    const allOrders = [];
+    for (const pos of entryPositions.slice(0, 8)) {
+      // 悬停在条目中央
+      await page.mouse.move(pos.centerX, pos.centerY);
+      await page.waitForTimeout(600);
+
+      // 再悬停到条目右侧（"查看订单"可能在右侧边缘）
+      await page.mouse.move(pos.rightX, pos.centerY);
+      await page.waitForTimeout(600);
+
+      // 搜索悬停后出现的"查看订单"
+      const hoverBtn = await page.evaluate((entryY) => {
+        const keywords = ['查看订单', '查看', '订单详情', '订单'];
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+        const candidates = [];
+
+        while (walker.nextNode()) {
+          const text = walker.currentNode.textContent.trim();
+          if (!keywords.includes(text)) continue;
+          const el = walker.currentNode.parentElement;
+          if (!el) continue;
+          const rect = el.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+          if (rect.width > 300 || rect.height > 60) continue;
+          const yDist = Math.abs(rect.y + rect.height / 2 - entryY);
+          if (yDist > 80) continue;
+          candidates.push({
+            x: rect.x + rect.width / 2,
+            y: rect.y + rect.height / 2,
+            text,
+            yDist,
+            area: rect.width * rect.height,
+          });
+        }
+
+        // 也搜索 title/aria-label
+        for (const el of document.querySelectorAll('[title*="订单"], [aria-label*="订单"]')) {
+          const rect = el.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+          if (rect.width > 200 || rect.height > 60) continue;
+          const yDist = Math.abs(rect.y + rect.height / 2 - entryY);
+          if (yDist > 80) continue;
+          const attrText = el.getAttribute('title') || el.getAttribute('aria-label') || '';
+          candidates.push({
+            x: rect.x + rect.width / 2,
+            y: rect.y + rect.height / 2,
+            text: attrText,
+            yDist,
+            area: rect.width * rect.height,
+          });
+        }
+
+        if (candidates.length === 0) return null;
+        // 优先最近 + 最小面积
+        candidates.sort((a, b) => (a.yDist - b.yDist) || (a.area - b.area));
+        return candidates[0];
+      }, pos.centerY);
+
+      if (!hoverBtn) continue;
+
+      console.log(`[浏览器] 悬停后找到"${hoverBtn.text}"`);
+      await page.mouse.click(hoverBtn.x, hoverBtn.y);
+      await page.waitForTimeout(2000);
+
+      const orders = await extractOrdersFromPopup(page);
+      try { await page.keyboard.press('Escape'); await page.waitForTimeout(500); } catch {}
+
+      if (orders.length > 0) {
+        allOrders.push(...orders);
+        // 如果是全量订单弹窗（多条），不需要逐条悬停
+        if (orders.length > 1) {
+          console.log(`[浏览器] 获取到全量订单 ${orders.length} 条，停止逐条悬停`);
+          break;
+        }
+      }
+    }
+
+    console.log(`[浏览器] 共提取到 ${allOrders.length} 条订单`);
+    return allOrders;
   } catch (e) {
     console.error('[浏览器] 提取订单异常:', e.message);
     try { await page.keyboard.press('Escape'); } catch {}
