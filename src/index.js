@@ -14,8 +14,8 @@ const config = require('./config');
 const {
   launchBrowser,
   enterLiveRoom,
-  getTransactionCount,
   getRecentComments,
+  getOrdersFromTab,
   getOrderInfo,
   nowBeijing,
 } = require('./browser');
@@ -78,9 +78,6 @@ function recordKey(r) {
 
 const recordedComments = loadDedup();
 let pendingOutbox = loadOutbox();
-
-// 上一次读到的成交人数
-let lastTransactionCount = null;
 
 // 订单获取重试计数（内存，进程生命周期内有效）
 const orderRetryCount = new Map();
@@ -181,42 +178,70 @@ function rebuildOutbox() {
 }
 
 /**
- * 处理一次成交人数变化事件
+ * 扫描近期评论和"已下单"记录，处理新条目
+ *
+ * 1. 先从"全部"标签获取评论（包括"已下单"条目）
+ * 2. 再从"已下单"标签获取订单条目（可能捕获到"全部"标签遗漏的）
+ * 3. 合并去重后处理
  */
-async function handleTransactionChange(page) {
+async function processNewComments(page) {
+  // 1. 获取"全部"标签中的评论
   const result = await getRecentComments(page, config.monitor.commentCheckMinutes);
 
   if (result.error) {
-    console.error('[主程序] 采集评论出错，跳过本轮（不推进水位线）:', result.error);
+    console.error('[主程序] 采集评论出错，跳过本轮:', result.error);
     return false;
   }
 
-  const comments = result.comments;
-  if (comments.length === 0) {
-    console.log('[主程序] 近期无新评论');
+  // 2. 获取"已下单"标签中的订单记录
+  const orderResult = await getOrdersFromTab(page, config.monitor.commentCheckMinutes);
+  if (orderResult.error) {
+    console.log('[主程序] "已下单"标签采集失败，仅处理评论:', orderResult.error);
+  }
+
+  // 3. 合并：评论 + 订单条目，按 key 去重
+  const allEntries = [...result.comments];
+  const seenKeys = new Set(allEntries.map(c => `${c.userId}_${c.time}_${c.content}`));
+  for (const order of (orderResult.orders || [])) {
+    const key = `${order.userId}_${order.time}_${order.content}`;
+    if (!seenKeys.has(key)) {
+      allEntries.push(order);
+      seenKeys.add(key);
+    }
+  }
+
+  if (allEntries.length === 0) {
+    console.log('[主程序] 近期无新评论或订单');
     return true;
   }
 
   const newRecords = [];
 
-  for (const comment of comments) {
+  for (const comment of allEntries) {
     const key = `${comment.userId}_${comment.time}_${comment.content}`;
     if (recordedComments.has(key)) {
       continue;
     }
 
-    console.log(`[主程序] 处理评论: ${comment.nickname}(${comment.userId}) ${comment.time} - ${comment.content}`);
+    console.log(`[主程序] 处理: ${comment.nickname}(${comment.userId}) ${comment.time} - ${comment.content}`);
 
+    // 对"已下单"条目和普通评论都尝试获取订单信息
     const orderInfo = await getOrderInfo(page, comment);
 
     if (!orderInfo) {
+      // 对"已下单"类型条目，重试更积极（一定有订单）
+      const isOrderEntry = comment.content === '已下单' || (comment.content && comment.content.includes('已下单'));
+      const maxRetries = isOrderEntry ? MAX_ORDER_RETRIES : 1;
+
       const retries = (orderRetryCount.get(key) || 0) + 1;
       orderRetryCount.set(key, retries);
-      if (retries < MAX_ORDER_RETRIES) {
-        console.log(`[主程序] 订单获取失败 (${retries}/${MAX_ORDER_RETRIES})，下轮重试: ${comment.nickname}`);
+      if (retries < maxRetries) {
+        console.log(`[主程序] 订单获取失败 (${retries}/${maxRetries})，下轮重试: ${comment.nickname}`);
         continue;
       }
-      console.log(`[主程序] 订单获取已达 ${MAX_ORDER_RETRIES} 次上限，以空订单写入: ${comment.nickname}`);
+      if (isOrderEntry) {
+        console.log(`[主程序] "已下单"条目订单获取已达 ${maxRetries} 次上限，以空订单写入: ${comment.nickname}`);
+      }
     }
 
     const record = {
@@ -240,6 +265,7 @@ async function handleTransactionChange(page) {
 
 /**
  * 主监控循环
+ * 每轮周期性扫描评论区，处理新评论和"已下单"订单，不再依赖成交人数作为触发条件。
  */
 async function monitorLoop(page) {
   const intervalMs = config.monitor.intervalSeconds * 1000;
@@ -256,30 +282,8 @@ async function monitorLoop(page) {
 
   while (true) {
     try {
-      const currentCount = await getTransactionCount(page);
-
-      if (currentCount === null) {
-        console.log(`[主程序] [${nowBeijing().format('HH:mm:ss')}] 未能获取成交人数，稍后重试...`);
-      } else if (lastTransactionCount === null) {
-        lastTransactionCount = currentCount;
-        console.log(`[主程序] [${nowBeijing().format('HH:mm:ss')}] 初始成交人数: ${currentCount}`);
-      } else if (currentCount !== lastTransactionCount) {
-        console.log(
-          `[主程序] [${nowBeijing().format('HH:mm:ss')}] ` +
-          `成交人数变化: ${lastTransactionCount} -> ${currentCount} (+${currentCount - lastTransactionCount})`
-        );
-        const prevCount = lastTransactionCount;
-        const ok = await handleTransactionChange(page);
-        // 只有采集成功才推进水位线
-        if (ok) {
-          lastTransactionCount = currentCount;
-        } else {
-          lastTransactionCount = prevCount;
-          console.log('[主程序] 采集失败，水位线不推进，下次仍会触发');
-        }
-      } else {
-        console.log(`[主程序] [${nowBeijing().format('HH:mm:ss')}] 成交人数无变化: ${currentCount}`);
-      }
+      console.log(`[主程序] [${nowBeijing().format('HH:mm:ss')}] 扫描评论和订单...`);
+      await processNewComments(page);
 
       if (pendingOutbox.length > 0) {
         console.log(`[主程序] 重试 outbox 中 ${pendingOutbox.length} 条记录...`);

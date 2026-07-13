@@ -630,56 +630,180 @@ async function getRecentComments(page, withinMinutes) {
 }
 
 /**
+ * 切换到"已下单"标签页获取下单记录，然后切回"全部"
+ * 这是获取订单数据的主要途径：评论区的"已下单"tab 会列出所有下单用户
+ */
+async function getOrdersFromTab(page, withinMinutes) {
+  const cutoff = nowBeijing().subtract(withinMinutes, 'minute');
+  const orders = [];
+
+  try {
+    // 点击"已下单"标签
+    const orderTab = await page.$('text=已下单');
+    if (!orderTab) {
+      console.log('[浏览器] 未找到"已下单"标签');
+      return { orders: [], error: null };
+    }
+
+    await orderTab.click();
+    await page.waitForTimeout(1500);
+    console.log('[浏览器] 已切换到"已下单"标签');
+
+    // 获取"已下单"视图中的条目
+    const elements = await page.$$('[class*="comment"], [class*="message"], [class*="chat"], [class*="interact"], [class*="item"], li');
+
+    for (const el of elements) {
+      try {
+        const text = await el.textContent();
+        if (!text || !text.includes('已下单')) continue;
+
+        // 解析用户名和时间
+        const match = text.match(/([^\s(]+)(?:\(([^)]+)\))?\s+(\d{1,2}:\d{2}(?::\d{2})?)/);
+        if (!match) continue;
+
+        const [, nickname, userId, timeStr] = match;
+        const now = nowBeijing();
+        const today = now.format('YYYY-MM-DD');
+        const fullTimeStr = `${today} ${timeStr}`;
+        let orderTime = dayjs.tz(fullTimeStr, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+
+        if (orderTime.diff(now, 'hour') >= 1) {
+          orderTime = orderTime.subtract(1, 'day');
+        }
+
+        if (orderTime.isAfter(cutoff)) {
+          orders.push({
+            nickname: nickname?.trim() || '',
+            userId: userId?.trim() || nickname?.trim() || '',
+            time: orderTime.format('YYYY-MM-DD HH:mm:ss'),
+            content: '已下单',
+            element: el,
+          });
+        }
+      } catch {}
+    }
+
+    console.log(`[浏览器] "已下单"标签中获取到 ${orders.length} 条记录`);
+  } catch (e) {
+    console.error('[浏览器] 获取"已下单"标签数据异常:', e.message);
+    return { orders: [], error: e.message };
+  } finally {
+    // 切回"全部"标签
+    try {
+      const allTab = await page.$('text=全部');
+      if (allTab) {
+        await allTab.click();
+        await page.waitForTimeout(1000);
+      }
+    } catch {}
+  }
+
+  return { orders, error: null };
+}
+
+/**
  * 查看订单信息
- * 只在评论元素附近查找订单入口，不全页扫描（防止关联到错误评论）
- * 提取后验证 buyerId 与评论用户匹配
+ *
+ * 策略：
+ * 1. 悬停评论元素，显示隐藏的操作按钮
+ * 2. 在评论元素及其祖先容器内查找"查看订单"按钮/链接
+ * 3. 对"已下单"类型的评论，尝试直接点击该条目
+ * 4. 提取后验证 buyerId 与评论用户匹配
  */
 async function getOrderInfo(page, comment) {
   try {
-    const orderIconSelectors = [
+    if (!comment.element) {
+      console.log('[浏览器] 评论元素不可用，跳过订单关联');
+      return null;
+    }
+
+    // 悬停评论元素以显示可能隐藏的操作按钮
+    try {
+      await comment.element.hover();
+      await page.waitForTimeout(800);
+    } catch {}
+
+    // 收集可能包含"查看订单"按钮的容器（从近到远）
+    const containers = [];
+    try {
+      containers.push(comment.element);
+      const directParent = await comment.element.evaluateHandle(el => el.parentElement);
+      if (directParent) containers.push(directParent);
+      const ancestor = await comment.element.evaluateHandle(el =>
+        el.closest('[class*="interact"], [class*="chat"], [class*="comment"], [class*="msg"], [class*="item"], [class*="list"], li, tr')
+      );
+      if (ancestor) containers.push(ancestor);
+    } catch {}
+
+    // "查看订单"及订单相关按钮选择器
+    const orderSelectors = [
+      'text=查看订单',
+      'button:has-text("查看订单")',
+      'a:has-text("查看订单")',
+      'span:has-text("查看订单")',
+      'div:has-text("查看订单")',
+      'text=订单详情',
+      'button:has-text("订单")',
+      'a:has-text("订单")',
+      '[class*="order"]:has-text("查看")',
       '[class*="order"] svg',
       '[class*="order"] i',
       '[class*="order"] img',
-      '[class*="clipboard"]',
       '[title*="订单"]',
       '[aria-label*="订单"]',
-      'button:has-text("订单")',
-      '[class*="icon"]:near(:text("订单"))',
+      '[class*="clipboard"]',
     ];
 
-    // 只在评论元素的父容器范围内查找订单入口
-    if (comment.element) {
-      try {
-        const parent = await comment.element.evaluateHandle((el) =>
-          el.closest('[class*="interact"], [class*="chat"], [class*="comment-area"]')
-        );
-        if (parent) {
-          for (const sel of orderIconSelectors) {
-            const icon = await parent.$(sel);
-            if (icon) {
-              await icon.click();
-              await page.waitForTimeout(2000);
-              const orderInfo = await extractOrderFromPopup(page);
-              if (!orderInfo) return null;
+    // 在各层容器内搜索订单入口
+    for (const container of containers) {
+      for (const sel of orderSelectors) {
+        try {
+          const btn = await container.$(sel);
+          if (btn) {
+            const visible = await btn.isVisible().catch(() => true);
+            if (!visible) continue;
+            console.log(`[浏览器] 找到订单入口: ${sel}`);
+            await btn.click();
+            await page.waitForTimeout(2000);
+            const orderInfo = await extractOrderFromPopup(page);
+            if (orderInfo) {
               if (comment.userId && !orderInfo.buyerId) {
-                console.log(`[浏览器] 订单缺少买家ID，无法验证与评论者(${comment.userId})的关联，跳过`);
+                console.log(`[浏览器] 订单缺少买家ID，跳过`);
                 return null;
               }
               if (orderInfo.buyerId && comment.userId && orderInfo.buyerId !== comment.userId) {
-                console.log(`[浏览器] 订单买家(${orderInfo.buyerId})与评论者(${comment.userId})不匹配，跳过`);
+                console.log(`[浏览器] 买家(${orderInfo.buyerId})与评论者(${comment.userId})不匹配，跳过`);
                 return null;
               }
               return orderInfo;
             }
           }
-        }
-      } catch {
-        // 元素可能已失效
+        } catch {}
       }
     }
 
-    // 没有在评论附近找到订单入口，不做全页扫描
-    console.log(`[浏览器] 评论附近未找到订单入口，跳过订单关联`);
+    // 对"已下单"类型评论，尝试点击条目本身
+    if (comment.content === '已下单' || (comment.content && comment.content.includes('已下单'))) {
+      try {
+        await comment.element.click();
+        await page.waitForTimeout(2000);
+        const orderInfo = await extractOrderFromPopup(page);
+        if (orderInfo) return orderInfo;
+      } catch {}
+
+      // 尝试找到"已下单"文本元素并点击
+      try {
+        const orderLabel = await comment.element.$(':text("已下单")');
+        if (orderLabel) {
+          await orderLabel.click();
+          await page.waitForTimeout(2000);
+          const orderInfo = await extractOrderFromPopup(page);
+          if (orderInfo) return orderInfo;
+        }
+      } catch {}
+    }
+
+    console.log(`[浏览器] 未找到订单入口: ${comment.nickname}`);
   } catch (e) {
     console.error('[浏览器] 查看订单异常:', e.message);
   }
@@ -768,6 +892,7 @@ module.exports = {
   enterLiveRoom,
   getTransactionCount,
   getRecentComments,
+  getOrdersFromTab,
   getOrderInfo,
   nowBeijing,
 };
