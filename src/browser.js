@@ -562,20 +562,152 @@ async function getTransactionCount(page) {
   return null;
 }
 
+
 /**
- * 保存当前页面完整 HTML 到 data/page-dump.html，用于调试 DOM 结构
+ * 保存当前页面完整 HTML 到 data/page-dump.html，用于调试 DOM 结构。
+ * 同时运行诊断扫描，结果保存到 data/debug-scan.json。
  */
 async function dumpPageDOM(page) {
+  const dumpDir = path.resolve(__dirname, '..', 'data');
+  if (!fs.existsSync(dumpDir)) fs.mkdirSync(dumpDir, { recursive: true });
+
   try {
     const html = await page.content();
-    const dumpDir = path.resolve(__dirname, '..', 'data');
-    if (!fs.existsSync(dumpDir)) fs.mkdirSync(dumpDir, { recursive: true });
     const dumpPath = path.join(dumpDir, 'page-dump.html');
     fs.writeFileSync(dumpPath, html, 'utf8');
     console.log(`[浏览器] DOM 已保存到 ${dumpPath} (${(html.length / 1024).toFixed(1)} KB)`);
   } catch (e) {
     console.error('[浏览器] DOM dump 失败:', e.message);
   }
+
+  // 诊断扫描：检查所有 frame 并查找关键元素
+  try {
+    const scanResult = await debugScanPage(page);
+    const scanPath = path.join(dumpDir, 'debug-scan.json');
+    fs.writeFileSync(scanPath, JSON.stringify(scanResult, null, 2), 'utf8');
+    console.log(`[浏览器] 诊断扫描已保存到 ${scanPath}`);
+
+    // 输出关键诊断信息
+    for (let i = 0; i < scanResult.frames.length; i++) {
+      const f = scanResult.frames[i];
+      console.log(`[浏览器] Frame ${i}: url=${f.url?.substring(0, 80)}, 直播互动=${f.hasLiveInteraction}, 时间元素=${f.timePatternCount}, 样本文本数=${f.sampleTexts?.length || 0}`);
+    }
+  } catch (e) {
+    console.error('[浏览器] 诊断扫描失败:', e.message);
+  }
+}
+
+/**
+ * 诊断扫描：检查所有 frame，查找关键文本，帮助定位 DOM 结构
+ */
+async function debugScanPage(page) {
+  const frames = page.frames();
+  const result = {
+    frameCount: frames.length,
+    frames: [],
+    timestamp: nowBeijing().format('YYYY-MM-DD HH:mm:ss'),
+  };
+
+  for (let i = 0; i < frames.length; i++) {
+    const frame = frames[i];
+    try {
+      const scan = await frame.evaluate(() => {
+        const body = document.body;
+        if (!body) return { error: 'no body', url: window.location.href };
+
+        const findings = {
+          url: window.location.href,
+          hasLiveInteraction: body.textContent.includes('直播互动'),
+          hasAllTab: false,
+          hasOrderTab: false,
+          timePatternCount: 0,
+          headerPatternCount: 0,
+          sampleTexts: [],
+          commentCandidates: [],
+        };
+
+        // 检查标签文本
+        const fullText = body.textContent;
+        findings.hasAllTab = /全部\s*[|｜]?\s*用户/.test(fullText) || fullText.includes('全部');
+        findings.hasOrderTab = fullText.includes('已下单');
+
+        // 扫描所有可见文本元素，收集样本和匹配
+        const headerRegex = /(.+?)[\(（]([^)）]+)[\)）]\s*(\d{1,2}:\d{2})/;
+        const timeRegex = /\d{1,2}:\d{2}/;
+
+        for (const el of document.querySelectorAll('*')) {
+          // 只看叶子级或低深度元素
+          if (el.children.length > 10) continue;
+          const rect = el.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+
+          const text = el.textContent?.trim();
+          if (!text || text.length < 3 || text.length > 500) continue;
+
+          // 采样前 100 个有意义的文本
+          if (findings.sampleTexts.length < 100 && text.length >= 3 && text.length <= 200) {
+            // 避免重复
+            if (!findings.sampleTexts.some(s => s.text === text.substring(0, 100))) {
+              findings.sampleTexts.push({
+                text: text.substring(0, 100),
+                tag: el.tagName,
+                pos: `${rect.x.toFixed(0)},${rect.y.toFixed(0)}`,
+                size: `${rect.width.toFixed(0)}x${rect.height.toFixed(0)}`,
+              });
+            }
+          }
+
+          if (timeRegex.test(text)) {
+            findings.timePatternCount++;
+          }
+
+          if (headerRegex.test(text)) {
+            findings.headerPatternCount++;
+            if (findings.commentCandidates.length < 20) {
+              findings.commentCandidates.push({
+                text: text.substring(0, 150),
+                tag: el.tagName,
+                pos: `${rect.x.toFixed(0)},${rect.y.toFixed(0)}`,
+                size: `${rect.width.toFixed(0)}x${rect.height.toFixed(0)}`,
+                children: el.children.length,
+              });
+            }
+          }
+        }
+
+        return findings;
+      });
+      result.frames.push(scan);
+    } catch (e) {
+      result.frames.push({ error: e.message, url: frame.url() });
+    }
+  }
+
+  return result;
+}
+
+/**
+ * 获取包含"直播互动"内容的 frame（可能是 iframe）
+ * 优先找包含"直播互动"文本的 frame，否则回退到主 frame
+ */
+async function getContentFrame(page) {
+  const frames = page.frames();
+  if (frames.length === 1) return page;
+
+  for (const frame of frames) {
+    try {
+      const hasContent = await frame.evaluate(() => {
+        return document.body?.textContent?.includes('直播互动') || false;
+      });
+      if (hasContent) {
+        console.log(`[浏览器] 在 frame(${frame.url().substring(0, 60)}) 中找到"直播互动"`);
+        return frame;
+      }
+    } catch {}
+  }
+
+  console.log('[浏览器] 未在任何 iframe 中找到"直播互动"，使用主 frame');
+  return page;
 }
 
 /**
@@ -583,24 +715,23 @@ async function dumpPageDOM(page) {
  * 先定位"直播互动"容器，再在其中查找标签，避免误点右侧"口袋商品"区域
  */
 async function clickCommentTab(page, tabText) {
+  const frame = await getContentFrame(page);
   try {
-    const clicked = await page.evaluate((text) => {
+    const clicked = await frame.evaluate((text) => {
       // 先定位"直播互动"标题所在的容器
-      const walker = document.createTreeWalker(
-        document.body, NodeFilter.SHOW_TEXT, null
-      );
       let interactionContainer = null;
-      while (walker.nextNode()) {
-        if (walker.currentNode.textContent.trim() === '直播互动') {
-          let el = walker.currentNode.parentElement;
-          for (let i = 0; i < 8 && el; i++) {
-            if (el.getBoundingClientRect().height > 200) {
-              interactionContainer = el;
+      for (const el of document.querySelectorAll('*')) {
+        const ownText = el.textContent?.trim();
+        if (ownText === '直播互动' || (ownText?.startsWith('直播互动') && ownText.length < 20)) {
+          let parent = el;
+          for (let i = 0; i < 8 && parent; i++) {
+            if (parent.getBoundingClientRect().height > 200) {
+              interactionContainer = parent;
               break;
             }
-            el = el.parentElement;
+            parent = parent.parentElement;
           }
-          break;
+          if (interactionContainer) break;
         }
       }
 
@@ -612,19 +743,20 @@ async function clickCommentTab(page, tabText) {
 
         const rect = el.getBoundingClientRect();
         if (rect.width === 0 || rect.height === 0) continue;
-        if (rect.left > window.innerWidth * 0.5) continue;
+        if (rect.left > window.innerWidth * 0.6) continue;
         if (rect.width > 200 || rect.height > 60) continue;
 
         el.click();
-        return true;
+        return { clicked: true, container: !!interactionContainer };
       }
-      return false;
+      return { clicked: false, container: !!interactionContainer };
     }, tabText);
 
-    if (clicked) {
+    if (clicked.clicked) {
       await page.waitForTimeout(1000);
+      console.log(`[浏览器] 点击了"${tabText}"标签 (container=${clicked.container})`);
     } else {
-      console.log(`[浏览器] 未找到评论区"${tabText}"标签`);
+      console.log(`[浏览器] 未找到"${tabText}"标签 (container=${clicked.container})`);
     }
   } catch (e) {
     console.log(`[浏览器] 点击"${tabText}"标签失败:`, e.message);
@@ -652,76 +784,113 @@ function parseCommentTime(timeStr) {
 /**
  * 获取近期评论
  *
- * 使用 TreeWalker 遍历文本节点，用正则匹配评论头部 昵称(用户ID) HH:mm，
- * 匹配到的节点的下一个兄弟/子元素即为评论内容。不依赖 CSS class 名。
- * 如果文本节点扫描无结果，回退到元素级文本匹配。
+ * 多策略提取：
+ *   1. 元素级 textContent 扫描（主策略 — 处理文本分散在多个子元素的情况）
+ *   2. TreeWalker 文本节点扫描（补充 — 处理文本在单个节点的情况）
+ *   3. 自动检测并使用正确的 frame（处理 iframe 场景）
+ *
+ * 每轮都输出诊断日志，方便排查问题。
  */
 async function getRecentComments(page, withinMinutes) {
   const cutoff = nowBeijing().subtract(withinMinutes, 'minute');
   console.log(`[浏览器] 获取 ${cutoff.format('HH:mm:ss')} 之后的评论...`);
 
+  const frame = await getContentFrame(page);
   await clickCommentTab(page, '全部');
 
   const comments = [];
 
   try {
-    const rawComments = await page.evaluate(() => {
+    const rawComments = await frame.evaluate(() => {
       const results = [];
       const seen = new Set();
-      const headerRegex = /(.+?)\(([^)]+)\)\s+(\d{1,2}:\d{2}(?::\d{2})?)/;
+      // 支持半角()和全角（）
+      const headerRegex = /(.+?)[\(（]([^)）]+)[\)）]\s*(\d{1,2}:\d{2}(?::\d{2})?)/;
 
-      // ── Pass 1: TreeWalker 文本节点扫描 ──
-      const walker = document.createTreeWalker(
-        document.body, NodeFilter.SHOW_TEXT, null
-      );
-      while (walker.nextNode()) {
-        const nodeText = walker.currentNode.textContent.trim();
-        if (!nodeText || nodeText.length < 5 || nodeText.length > 200) continue;
+      const debug = {
+        strategy: 'none',
+        elementsScanCount: 0,
+        timePatternCount: 0,
+        headerMatchCount: 0,
+        contentFoundCount: 0,
+        treewalkerMatchCount: 0,
+      };
 
-        const match = nodeText.match(headerRegex);
-        if (!match) continue;
+      // ── 策略1: 元素 textContent 扫描 ──
+      // 这是主策略：el.textContent 会自动拼接所有子节点的文本，
+      // 所以即使昵称、ID、时间在不同的 <span> 中也能匹配到
+      const allElements = document.querySelectorAll('div, span, li, p, a, td');
+      for (const el of allElements) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.left > window.innerWidth * 0.6) continue;
+        // 跳过非常大的容器（包含多条评论的面板）
+        if (rect.height > 200) continue;
+        if (rect.height < 8) continue;
 
-        const [fullMatch, nickname, userId, timeStr] = match;
+        debug.elementsScanCount++;
+
+        const text = el.textContent?.trim();
+        if (!text || text.length < 5) continue;
+
+        // 快速过滤：必须包含时间模式
+        if (!/\d{1,2}:\d{2}/.test(text)) continue;
+        debug.timePatternCount++;
+
+        // 跳过子元素过多的容器
+        const childCount = el.querySelectorAll('div, span, li, p').length;
+        if (childCount > 15) continue;
+        if (text.length > 500) continue;
+
+        const m = text.match(headerRegex);
+        if (!m) continue;
+        debug.headerMatchCount++;
+
+        const [fullMatch, nickname, userId, timeStr] = m;
         const hour = parseInt(timeStr.split(':')[0], 10);
         if (hour > 23) continue;
         if (nickname.includes('AI助理') || nickname.includes('问答助手')) continue;
+        if (nickname.includes('系统消息') || nickname.includes('管理员')) continue;
 
-        const headerEl = walker.currentNode.parentElement;
-        if (!headerEl) continue;
-
-        const rect = headerEl.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) continue;
-        if (rect.left > window.innerWidth * 0.5) continue;
-
-        // 查找评论内容
+        // 提取评论内容
         let content = '';
 
-        // Case 1: 时间之后同一文本节点中还有内容
-        const afterTime = nodeText.substring(nodeText.indexOf(timeStr) + timeStr.length).trim();
-        if (afterTime) {
-          content = afterTime.split(/[\n\r]+/)[0].trim();
+        // 方法A: 全匹配之后、同元素内的剩余文本
+        const afterIdx = text.indexOf(fullMatch);
+        if (afterIdx >= 0) {
+          const afterText = text.substring(afterIdx + fullMatch.length).trim();
+          if (afterText) {
+            // 取第一行，排除后续评论的头部
+            const lines = afterText.split(/[\n\r]+/);
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (trimmed && !headerRegex.test(trimmed)) {
+                content = trimmed;
+                break;
+              }
+            }
+          }
         }
 
-        // Case 2: 头部元素的下一个兄弟元素
+        // 方法B: 当前元素的下一个兄弟元素
         if (!content) {
-          const nextSib = headerEl.nextElementSibling;
+          const nextSib = el.nextElementSibling;
           if (nextSib) {
             const sibText = nextSib.textContent?.trim();
-            if (sibText && sibText.length < 300 && !sibText.match(headerRegex)) {
+            if (sibText && sibText.length < 300 && !headerRegex.test(sibText)) {
               content = sibText.split(/[\n\r]+/)[0].trim();
             }
           }
         }
 
-        // Case 3: 父容器内，头部元素之后的第一个子元素
-        if (!content && headerEl.parentElement) {
-          const parent = headerEl.parentElement;
-          let foundHeader = false;
-          for (const child of parent.children) {
-            if (child === headerEl) { foundHeader = true; continue; }
-            if (foundHeader) {
+        // 方法C: 父元素中，当前元素之后的下一个子元素
+        if (!content && el.parentElement) {
+          let foundEl = false;
+          for (const child of el.parentElement.children) {
+            if (child === el || child.contains(el)) { foundEl = true; continue; }
+            if (foundEl) {
               const childText = child.textContent?.trim();
-              if (childText && childText.length < 300 && !childText.match(headerRegex)) {
+              if (childText && childText.length < 300 && !headerRegex.test(childText)) {
                 content = childText.split(/[\n\r]+/)[0].trim();
                 break;
               }
@@ -729,20 +898,28 @@ async function getRecentComments(page, withinMinutes) {
           }
         }
 
-        // Case 4: 同一元素内，textContent 中头部匹配之后的文本
+        // 方法D: 向上找父容器，取父容器中本头部之后的文本
         if (!content) {
-          const fullText = (headerEl.parentElement || headerEl).textContent?.trim() || '';
-          const matchIdx = fullText.indexOf(fullMatch);
-          if (matchIdx >= 0) {
-            const afterMatch = fullText.substring(matchIdx + fullMatch.length).trim();
-            if (afterMatch) {
-              content = afterMatch.split(/[\n\r]+/)[0].trim();
+          for (let parent = el.parentElement; parent && !content; parent = parent.parentElement) {
+            const pr = parent.getBoundingClientRect();
+            if (pr.height > 150) break;
+            let foundEl = false;
+            for (const child of parent.children) {
+              if (child === el || child.contains(el)) { foundEl = true; continue; }
+              if (foundEl) {
+                const childText = child.textContent?.trim();
+                if (childText && childText.length < 300 && !headerRegex.test(childText)) {
+                  content = childText.split(/[\n\r]+/)[0].trim();
+                  break;
+                }
+              }
             }
           }
         }
 
         if (!content) continue;
         if (content.startsWith('私密回复')) continue;
+        debug.contentFoundCount++;
 
         const key = `${nickname.trim()}_${userId}_${timeStr}_${content}`;
         if (seen.has(key)) continue;
@@ -756,47 +933,109 @@ async function getRecentComments(page, withinMinutes) {
         });
       }
 
-      // ── Pass 2: 元素级回退（TreeWalker 无结果时） ──
+      if (results.length > 0) {
+        debug.strategy = 'element-scan';
+      }
+
+      // ── 策略2: TreeWalker 文本节点扫描（回退） ──
       if (results.length === 0) {
-        const elemRegex = /(.+?)\(([^)]+)\)\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*([\s\S]+)/;
-        for (const el of document.querySelectorAll('div, li, p, span')) {
-          const rect = el.getBoundingClientRect();
+        const walker = document.createTreeWalker(
+          document.body, NodeFilter.SHOW_TEXT, null
+        );
+        while (walker.nextNode()) {
+          const nodeText = walker.currentNode.textContent.trim();
+          if (!nodeText || nodeText.length < 5 || nodeText.length > 200) continue;
+
+          const match = nodeText.match(headerRegex);
+          if (!match) continue;
+          debug.treewalkerMatchCount++;
+
+          const [fullMatch, nickname, userId, timeStr] = match;
+          const hour = parseInt(timeStr.split(':')[0], 10);
+          if (hour > 23) continue;
+          if (nickname.includes('AI助理') || nickname.includes('问答助手')) continue;
+
+          const headerEl = walker.currentNode.parentElement;
+          if (!headerEl) continue;
+
+          const rect = headerEl.getBoundingClientRect();
           if (rect.width === 0 || rect.height === 0) continue;
-          if (rect.left > window.innerWidth * 0.5) continue;
-          if (rect.height > 200 || rect.height < 8) continue;
+          if (rect.left > window.innerWidth * 0.6) continue;
 
-          const text = el.textContent?.trim();
-          if (!text || text.length < 5 || text.length > 500) continue;
-          if (el.querySelectorAll('div, li, p, span').length > 20) continue;
+          let content = '';
 
-          const m = text.match(elemRegex);
-          if (!m) continue;
+          // 时间之后同一文本节点中的内容
+          const afterTime = nodeText.substring(nodeText.indexOf(timeStr) + timeStr.length).trim();
+          if (afterTime) {
+            content = afterTime.split(/[\n\r]+/)[0].trim();
+          }
 
-          const [, nick, uid, ts, rawContent] = m;
-          const h = parseInt(ts.split(':')[0], 10);
-          if (h > 23) continue;
-          if (nick.includes('AI助理') || nick.includes('问答助手')) continue;
+          // 下一个兄弟元素
+          if (!content) {
+            const nextSib = headerEl.nextElementSibling;
+            if (nextSib) {
+              const sibText = nextSib.textContent?.trim();
+              if (sibText && sibText.length < 300 && !sibText.match(headerRegex)) {
+                content = sibText.split(/[\n\r]+/)[0].trim();
+              }
+            }
+          }
 
-          const c = rawContent.trim().split(/[\n\r]+/)[0]?.trim() || '';
-          if (!c || c.startsWith('私密回复')) continue;
+          // 父容器的下一个子元素
+          if (!content && headerEl.parentElement) {
+            let foundHeader = false;
+            for (const child of headerEl.parentElement.children) {
+              if (child === headerEl) { foundHeader = true; continue; }
+              if (foundHeader) {
+                const childText = child.textContent?.trim();
+                if (childText && childText.length < 300 && !childText.match(headerRegex)) {
+                  content = childText.split(/[\n\r]+/)[0].trim();
+                  break;
+                }
+              }
+            }
+          }
 
-          const k = `${nick.trim()}_${uid}_${ts}_${c}`;
-          if (seen.has(k)) continue;
-          seen.add(k);
+          if (!content) continue;
+          if (content.startsWith('私密回复')) continue;
+
+          const key = `${nickname.trim()}_${userId}_${timeStr}_${content}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
 
           results.push({
-            nickname: nick.trim(),
-            userId: uid.trim(),
-            timeStr: ts,
-            content: c,
+            nickname: nickname.trim(),
+            userId: userId.trim(),
+            timeStr,
+            content,
           });
+        }
+
+        if (results.length > 0) {
+          debug.strategy = 'treewalker';
         }
       }
 
-      return { results, pass: results.length > 0 ? 'treewalker' : 'fallback' };
+      return { results, debug };
     });
 
-    console.log(`[浏览器] 评论扫描 (${rawComments.pass}): 找到 ${rawComments.results.length} 条`);
+    // 输出诊断日志
+    const d = rawComments.debug;
+    console.log(`[浏览器] 评论扫描诊断: strategy=${d.strategy}, elements=${d.elementsScanCount}, timePat=${d.timePatternCount}, headerMatch=${d.headerMatchCount}, contentFound=${d.contentFoundCount}, treewalker=${d.treewalkerMatchCount}`);
+    console.log(`[浏览器] 原始评论数: ${rawComments.results.length}`);
+
+    if (rawComments.results.length === 0) {
+      // 额外诊断：保存当前页面快照以便调试
+      try {
+        const dumpDir = path.resolve(__dirname, '..', 'data');
+        const scanResult = await debugScanPage(page);
+        fs.writeFileSync(
+          path.join(dumpDir, 'debug-scan-live.json'),
+          JSON.stringify(scanResult, null, 2), 'utf8'
+        );
+        console.log('[浏览器] 未找到评论，已保存实时诊断到 data/debug-scan-live.json');
+      } catch {}
+    }
 
     for (const c of rawComments.results) {
       const commentTime = parseCommentTime(c.timeStr);
@@ -820,43 +1059,41 @@ async function getRecentComments(page, withinMinutes) {
 
 /**
  * 切换到"已下单"标签页获取下单记录，然后切回"全部"
- * 使用 TreeWalker 文本节点扫描，匹配 昵称(用户ID) HH:mm 格式
+ * 使用元素 textContent + TreeWalker 双策略，支持 iframe
  */
 async function getOrdersFromTab(page, withinMinutes) {
   const cutoff = nowBeijing().subtract(withinMinutes, 'minute');
   const orders = [];
+  const frame = await getContentFrame(page);
 
   try {
     await clickCommentTab(page, '已下单');
     console.log('[浏览器] 已切换到"已下单"标签');
 
-    const rawOrders = await page.evaluate(() => {
+    const rawOrders = await frame.evaluate(() => {
       const results = [];
       const seen = new Set();
-      const headerRegex = /(.+?)\(([^)]+)\)\s+(\d{1,2}:\d{2}(?::\d{2})?)/;
+      const headerRegex = /(.+?)[\(（]([^)）]+)[\)）]\s*(\d{1,2}:\d{2}(?::\d{2})?)/;
 
-      // TreeWalker 文本节点扫描
-      const walker = document.createTreeWalker(
-        document.body, NodeFilter.SHOW_TEXT, null
-      );
-      while (walker.nextNode()) {
-        const nodeText = walker.currentNode.textContent.trim();
-        if (!nodeText || nodeText.length < 5 || nodeText.length > 200) continue;
+      // 策略1: 元素 textContent 扫描（主策略）
+      for (const el of document.querySelectorAll('div, span, li, p, a')) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.left > window.innerWidth * 0.6) continue;
+        if (rect.height > 200 || rect.height < 8) continue;
 
-        const match = nodeText.match(headerRegex);
-        if (!match) continue;
+        const text = el.textContent?.trim();
+        if (!text || text.length < 5 || text.length > 500) continue;
+        if (!/\d{1,2}:\d{2}/.test(text)) continue;
+        if (el.querySelectorAll('div, span, li, p').length > 15) continue;
 
-        const [, nickname, userId, timeStr] = match;
+        const m = text.match(headerRegex);
+        if (!m) continue;
+
+        const [, nickname, userId, timeStr] = m;
         const hour = parseInt(timeStr.split(':')[0], 10);
         if (hour > 23) continue;
         if (nickname.includes('AI助理') || nickname.includes('问答助手')) continue;
-
-        const headerEl = walker.currentNode.parentElement;
-        if (!headerEl) continue;
-
-        const rect = headerEl.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) continue;
-        if (rect.left > window.innerWidth * 0.5) continue;
 
         const key = `${nickname.trim()}_${userId}_${timeStr}`;
         if (seen.has(key)) continue;
@@ -869,36 +1106,31 @@ async function getOrdersFromTab(page, withinMinutes) {
         });
       }
 
-      // 元素级回退
+      // 策略2: TreeWalker 回退
       if (results.length === 0) {
-        const elemRegex = /(.+?)\(([^)]+)\)\s*(\d{1,2}:\d{2}(?::\d{2})?)/;
-        for (const el of document.querySelectorAll('div, li, p, span')) {
-          const rect = el.getBoundingClientRect();
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+        while (walker.nextNode()) {
+          const nodeText = walker.currentNode.textContent.trim();
+          if (!nodeText || nodeText.length < 5 || nodeText.length > 200) continue;
+          const match = nodeText.match(headerRegex);
+          if (!match) continue;
+
+          const [, nickname, userId, timeStr] = match;
+          const hour = parseInt(timeStr.split(':')[0], 10);
+          if (hour > 23) continue;
+          if (nickname.includes('AI助理') || nickname.includes('问答助手')) continue;
+
+          const headerEl = walker.currentNode.parentElement;
+          if (!headerEl) continue;
+          const rect = headerEl.getBoundingClientRect();
           if (rect.width === 0 || rect.height === 0) continue;
-          if (rect.left > window.innerWidth * 0.5) continue;
-          if (rect.height > 150 || rect.height < 8) continue;
+          if (rect.left > window.innerWidth * 0.6) continue;
 
-          const text = el.textContent?.trim();
-          if (!text || text.length > 300) continue;
-          if (el.querySelectorAll('div, li, p, span').length > 15) continue;
+          const key = `${nickname.trim()}_${userId}_${timeStr}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
 
-          const m = text.match(elemRegex);
-          if (!m) continue;
-
-          const [, nick, uid, ts] = m;
-          const h = parseInt(ts.split(':')[0], 10);
-          if (h > 23) continue;
-          if (nick.includes('AI助理') || nick.includes('问答助手')) continue;
-
-          const k = `${nick.trim()}_${uid}_${ts}`;
-          if (seen.has(k)) continue;
-          seen.add(k);
-
-          results.push({
-            nickname: nick.trim(),
-            userId: uid.trim(),
-            timeStr: ts,
-          });
+          results.push({ nickname: nickname.trim(), userId: userId.trim(), timeStr });
         }
       }
 
@@ -936,7 +1168,8 @@ async function getOrdersFromTab(page, withinMinutes) {
  * 支持三种策略：真实 <table>、div-based 表格、正则兜底
  */
 async function extractOrdersFromPopup(page) {
-  return page.evaluate(() => {
+  const frame = await getContentFrame(page);
+  return frame.evaluate(() => {
     const results = [];
 
     // 查找包含订单信息的对话框/面板
@@ -1076,13 +1309,14 @@ async function extractOrdersFromPopup(page) {
  *   3. 点击后从弹出的订单详情中提取数据
  */
 async function extractAllOrders(page) {
+  const frame = await getContentFrame(page);
   try {
     // 确保在"全部"标签（用户说"查看订单"在全部数据的评论右侧）
     await clickCommentTab(page, '全部');
     await page.waitForTimeout(500);
 
     // ── 第1步：直接搜索"查看订单"（不过滤位置——按钮在评论数据右侧）──
-    const directBtn = await page.evaluate(() => {
+    const directBtn = await frame.evaluate(() => {
       const keywords = ['查看订单', '查看全部订单', '订单详情'];
       const candidates = [];
 
@@ -1161,7 +1395,7 @@ async function extractAllOrders(page) {
     // ── 第2步：悬停"已下单"条目，在其右侧寻找"查看订单" ──
     console.log('[浏览器] 查找"已下单"条目进行悬停...');
 
-    const entryPositions = await page.evaluate(() => {
+    const entryPositions = await frame.evaluate(() => {
       const positions = [];
       const seen = new Set();
 
@@ -1217,7 +1451,7 @@ async function extractAllOrders(page) {
       await page.waitForTimeout(600);
 
       // 搜索悬停后出现的"查看订单"
-      const hoverBtn = await page.evaluate((entryY) => {
+      const hoverBtn = await frame.evaluate((entryY) => {
         const keywords = ['查看订单', '查看', '订单详情', '订单'];
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
         const candidates = [];
@@ -1296,6 +1530,7 @@ module.exports = {
   launchBrowser,
   enterLiveRoom,
   dumpPageDOM,
+  debugScanPage,
   getTransactionCount,
   getRecentComments,
   getOrdersFromTab,
