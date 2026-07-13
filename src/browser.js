@@ -631,7 +631,10 @@ async function getOrderInfo(page, comment) {
               await page.waitForTimeout(2000);
               const orderInfo = await extractOrderFromPopup(page);
               if (!orderInfo) return null;
-              // 验证买家与评论者匹配
+              if (comment.userId && !orderInfo.buyerId) {
+                console.log(`[浏览器] 订单缺少买家ID，无法验证与评论者(${comment.userId})的关联，跳过`);
+                return null;
+              }
               if (orderInfo.buyerId && comment.userId && orderInfo.buyerId !== comment.userId) {
                 console.log(`[浏览器] 订单买家(${orderInfo.buyerId})与评论者(${comment.userId})不匹配，跳过`);
                 return null;

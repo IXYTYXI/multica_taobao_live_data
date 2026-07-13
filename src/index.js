@@ -30,36 +30,50 @@ function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-function loadDedup() {
+function atomicWrite(filePath, data) {
+  ensureDataDir();
+  const tmp = filePath + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
   try {
-    if (fs.existsSync(DEDUP_FILE)) {
-      return new Set(JSON.parse(fs.readFileSync(DEDUP_FILE, 'utf8')));
-    }
-  } catch (e) {
-    console.error('[持久化] 加载去重文件失败，使用空集合:', e.message);
+    fs.renameSync(tmp, filePath);
+  } catch {
+    try { fs.unlinkSync(filePath); } catch {}
+    fs.renameSync(tmp, filePath);
   }
-  return new Set();
+}
+
+function loadJSON(filePath) {
+  for (const f of [filePath, filePath + '.tmp']) {
+    try {
+      if (fs.existsSync(f)) {
+        const content = fs.readFileSync(f, 'utf8');
+        if (content.trim()) return JSON.parse(content);
+      }
+    } catch {}
+  }
+  return null;
+}
+
+function loadDedup() {
+  const data = loadJSON(DEDUP_FILE);
+  return data ? new Set(data) : new Set();
 }
 
 function saveDedup(set) {
-  ensureDataDir();
-  fs.writeFileSync(DEDUP_FILE, JSON.stringify([...set]), 'utf8');
+  atomicWrite(DEDUP_FILE, [...set]);
 }
 
 function loadOutbox() {
-  try {
-    if (fs.existsSync(OUTBOX_FILE)) {
-      return JSON.parse(fs.readFileSync(OUTBOX_FILE, 'utf8'));
-    }
-  } catch (e) {
-    console.error('[持久化] 加载 outbox 失败:', e.message);
-  }
-  return [];
+  const data = loadJSON(OUTBOX_FILE);
+  return Array.isArray(data) ? data : [];
 }
 
 function saveOutbox(records) {
-  ensureDataDir();
-  fs.writeFileSync(OUTBOX_FILE, JSON.stringify(records, null, 2), 'utf8');
+  atomicWrite(OUTBOX_FILE, records);
+}
+
+function recordKey(r) {
+  return `${r.commenterID}_${r.commentTime}_${r.commentContent}`;
 }
 
 const recordedComments = loadDedup();
@@ -69,48 +83,67 @@ let pendingOutbox = loadOutbox();
 let lastTransactionCount = null;
 
 /**
- * 将一批记录写入飞书，成功后才标记去重。失败的留在 outbox 中。
+ * 将一批记录写入飞书。写入前先追加到 outbox（write-ahead），
+ * 成功后才标记去重并从 outbox 移除。
  */
 async function flushRecords(records) {
   if (records.length === 0) return;
 
-  const succeeded = [];
-  const failed = [];
+  const toSend = records.filter(r => !recordedComments.has(recordKey(r)));
+  if (toSend.length === 0) return;
 
-  // 先尝试批量写入
+  // Write-ahead: 确保待发送记录在 outbox 中（崩溃后可恢复）
+  const existingKeys = new Set(pendingOutbox.map(recordKey));
+  for (const r of toSend) {
+    if (!existingKeys.has(recordKey(r))) {
+      pendingOutbox.push(r);
+    }
+  }
+  saveOutbox(pendingOutbox);
+
+  const succeeded = [];
+
   try {
-    await writeBatchRecords(records);
-    succeeded.push(...records);
-    console.log(`[主程序] 成功写入 ${records.length} 条记录`);
+    await writeBatchRecords(toSend);
+    succeeded.push(...toSend);
+    console.log(`[主程序] 成功写入 ${toSend.length} 条记录`);
   } catch (e) {
-    console.error('[主程序] 批量写入失败，逐条重试:', e.message);
-    for (const record of records) {
-      try {
-        await writeRecord(record);
-        succeeded.push(record);
-      } catch (err) {
-        console.error(`[主程序] 单条写入失败: ${record.commenterID}`, err.message);
-        failed.push(record);
+    // 4xx = 服务端确认未处理，可安全逐条重试
+    // 网络超时/5xx 可能已部分写入，不立即重试，留 outbox 下轮再试
+    if (e.response && e.response.status >= 400 && e.response.status < 500) {
+      console.error('[主程序] 批量写入被拒绝，逐条重试:', e.message);
+      for (const record of toSend) {
+        try {
+          await writeRecord(record);
+          succeeded.push(record);
+        } catch (err) {
+          console.error(`[主程序] 单条写入失败: ${record.commenterID}`, err.message);
+        }
       }
+    } else {
+      console.error('[主程序] 批量写入失败（网络/超时），保留 outbox 下轮重试:', e.message);
     }
   }
 
-  // 只有成功写入的才加入去重集合
-  for (const record of succeeded) {
-    const key = `${record.commenterID}_${record.commentTime}_${record.commentContent}`;
-    recordedComments.add(key);
+  for (const r of succeeded) {
+    recordedComments.add(recordKey(r));
   }
   saveDedup(recordedComments);
 
-  // 失败的留在 outbox
-  pendingOutbox = [...pendingOutbox.filter((r) => {
-    const k = `${r.commenterID}_${r.commentTime}_${r.commentContent}`;
-    return !recordedComments.has(k);
-  }), ...failed];
+  // 重建 outbox：移除已确认的，按 key 去重防膨胀
+  const outboxMap = new Map();
+  for (const r of pendingOutbox) {
+    const k = recordKey(r);
+    if (!recordedComments.has(k) && !outboxMap.has(k)) {
+      outboxMap.set(k, r);
+    }
+  }
+  pendingOutbox = [...outboxMap.values()];
   saveOutbox(pendingOutbox);
 
-  if (failed.length > 0) {
-    console.log(`[主程序] ${failed.length} 条记录写入失败，已保存到 outbox 待重试`);
+  const failCount = toSend.length - succeeded.length;
+  if (failCount > 0) {
+    console.log(`[主程序] ${failCount} 条记录写入失败，保留在 outbox 待重试`);
   }
 }
 
@@ -205,10 +238,9 @@ async function monitorLoop(page) {
         console.log(`[主程序] [${nowBeijing().format('HH:mm:ss')}] 成交人数无变化: ${currentCount}`);
       }
 
-      // 定期重试 outbox
       if (pendingOutbox.length > 0) {
         console.log(`[主程序] 重试 outbox 中 ${pendingOutbox.length} 条记录...`);
-        await flushRecords([...pendingOutbox]);
+        await flushRecords(pendingOutbox);
       }
     } catch (e) {
       console.error(`[主程序] 监控循环异常: ${e.message}`);

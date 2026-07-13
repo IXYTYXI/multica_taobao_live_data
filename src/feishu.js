@@ -105,7 +105,7 @@ async function writeRecord(record) {
     fields['支付时间'] = payTs;
   }
 
-  const res = await axiosWithRetry(() => axios.post(
+  const res = await axios.post(
     `${FEISHU_BASE}/bitable/v1/apps/${baseAppToken}/tables/${tableId}/records`,
     { fields },
     {
@@ -115,7 +115,7 @@ async function writeRecord(record) {
       },
       timeout: REQUEST_TIMEOUT_MS,
     }
-  ));
+  );
 
   if (res.data.code !== 0) {
     throw new Error(`写入飞书失败: ${JSON.stringify(res.data)}`);
@@ -149,7 +149,7 @@ async function writeBatchRecords(records) {
     return { fields };
   });
 
-  const res = await axiosWithRetry(() => axios.post(
+  const res = await axios.post(
     `${FEISHU_BASE}/bitable/v1/apps/${baseAppToken}/tables/${tableId}/records/batch_create`,
     { records: batchRecords },
     {
@@ -159,7 +159,7 @@ async function writeBatchRecords(records) {
       },
       timeout: REQUEST_TIMEOUT_MS,
     }
-  ));
+  );
 
   if (res.data.code !== 0) {
     throw new Error(`批量写入飞书失败: ${JSON.stringify(res.data)}`);
