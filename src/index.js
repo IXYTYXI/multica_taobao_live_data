@@ -330,7 +330,12 @@ async function main() {
       }
     }
 
-    // 3. 开始监控循环
+    // 3. 等待中控台页面完全加载（商品列表、成交数据等需要额外渲染时间）
+    console.log('[主程序] 已进入中控台页面，等待页面数据加载...');
+    await new Promise((r) => setTimeout(r, 8000));
+    console.log('[主程序] 页面加载完成');
+
+    // 4. 开始监控循环
     await monitorLoop(page);
   } catch (e) {
     console.error('[致命错误]', e.message);

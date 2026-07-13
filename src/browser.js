@@ -485,45 +485,75 @@ async function enterLiveRoom(page) {
 }
 
 /**
- * 获取成交人数
+ * 获取成交人数（所有商品的成交人数之和）
+ *
+ * 淘宝直播中控台的"口袋商品"列表中，每个商品卡片都有一列"成交人数"，
+ * 数字在上、标签在下。本函数遍历所有"成交人数"标签，提取对应数字后求和。
  */
 async function getTransactionCount(page) {
-  const selectors = [
-    '[class*="transaction"] [class*="num"]',
-    '[class*="deal"] [class*="num"]',
-    '[class*="trade"] [class*="count"]',
-    '[class*="real-time"] [class*="value"]',
-  ];
-
-  for (const selector of selectors) {
-    try {
-      const el = await page.$(selector);
-      if (el) {
-        const text = await el.textContent();
-        const num = parseInt(text?.replace(/[^0-9]/g, '') || '0', 10);
-        return num;
-      }
-    } catch {
-      continue;
-    }
-  }
-
   try {
-    const allText = await page.$$eval('*', (els) =>
-      els.map((el) => ({
-        tag: el.tagName,
-        text: el.textContent?.trim()?.substring(0, 200),
-        className: el.className,
-      }))
-    );
+    const result = await page.evaluate(() => {
+      let sum = 0;
+      let found = false;
 
-    for (const item of allText) {
-      if (item.text && item.text.includes('成交人数')) {
-        const match = item.text.match(/成交人数[^\d]*(\d+)/);
-        if (match) {
-          return parseInt(match[1], 10);
+      // 用 TreeWalker 精准定位"成交人数"文本节点
+      const walker = document.createTreeWalker(
+        document.body, NodeFilter.SHOW_TEXT, null
+      );
+      const labelNodes = [];
+      while (walker.nextNode()) {
+        if (walker.currentNode.textContent.trim() === '成交人数') {
+          labelNodes.push(walker.currentNode.parentElement);
         }
       }
+
+      for (const labelEl of labelNodes) {
+        if (!labelEl) continue;
+        const container = labelEl.parentElement;
+        if (!container) continue;
+
+        // 方法1: 在父容器内查找前面的兄弟元素中的数字
+        let prev = labelEl.previousElementSibling;
+        if (prev) {
+          const numText = prev.textContent.trim().replace(/[,，\s]/g, '');
+          const num = parseInt(numText, 10);
+          if (!isNaN(num)) {
+            sum += num;
+            found = true;
+            continue;
+          }
+        }
+
+        // 方法2: 父容器的文本中提取 "数字\n成交人数" 模式
+        const containerText = container.textContent.trim();
+        const match = containerText.match(/(\d+)\s*[人]?\s*[\n\r\s]*成交人数/);
+        if (match) {
+          sum += parseInt(match[1], 10);
+          found = true;
+          continue;
+        }
+
+        // 方法3: 向上再找一层祖先容器
+        const grandParent = container.parentElement;
+        if (grandParent) {
+          const gpText = grandParent.textContent.trim();
+          const gpMatch = gpText.match(/(\d+)\s*[人]?\s*[\n\r\s]*成交人数/);
+          if (gpMatch) {
+            sum += parseInt(gpMatch[1], 10);
+            found = true;
+          }
+        }
+      }
+
+      return { sum, found, labelCount: labelNodes.length };
+    });
+
+    if (result.found) {
+      return result.sum;
+    }
+
+    if (result.labelCount === 0) {
+      console.log('[浏览器] 未找到"成交人数"标签，可能需要滚动到商品列表区域');
     }
   } catch (e) {
     console.error('[浏览器] 获取成交人数异常:', e.message);
