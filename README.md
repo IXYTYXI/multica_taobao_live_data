@@ -25,9 +25,126 @@
 |------|------|
 | Node.js | ≥ 18.0.0 |
 | 浏览器 | 本机已安装 **Google Chrome** |
-| 操作系统 | macOS / Windows（文档以 macOS 为例，Windows 路径见下文） |
+| 操作系统 | **Windows 10/11** 或 macOS（Windows 见下方专节） |
 | 网络 | 可访问淘宝直播中控台与飞书 Open API |
 | 飞书 | 已创建企业自建应用，并授权访问目标多维表格 |
+
+---
+
+## Windows 部署说明
+
+代码已适配 Windows（`win32`），流程与 macOS 相同，仅命令与路径不同。
+
+### 1. 安装 Node.js 与 Git
+
+1. 安装 [Node.js](https://nodejs.org/) LTS（≥ 18）
+2. 安装 [Git for Windows](https://git-scm.com/download/win)（自带 Git Bash，推荐在此终端操作）
+
+验证：
+
+```powershell
+node -v
+npm -v
+```
+
+### 2. 克隆与安装
+
+**PowerShell / CMD：**
+
+```powershell
+git clone https://gitlab.yc345.tv/fengyang1/taobao_live_data.git
+cd taobao_live_data
+npm install
+copy .env.example .env
+notepad .env
+```
+
+**Git Bash：**
+
+```bash
+git clone https://gitlab.yc345.tv/fengyang1/taobao_live_data.git
+cd taobao_live_data
+npm install
+cp .env.example .env
+```
+
+### 3. 推荐浏览器模式
+
+| 模式 | Windows 建议 |
+|------|----------------|
+| **`login`（推荐）** | 工具自带 Chrome 窗口，登录态存项目下 `chrome-data\`，与日常 Chrome 互不干扰 |
+| `profile` | 复制本机 Chrome Cookie；若 Chrome 正在运行，部分文件可能被锁定（代码会尝试 `robocopy` 兜底） |
+| `cdp` | 需单独用调试端口启动 Chrome，步骤见下文 |
+
+`.env` 示例：
+
+```ini
+BROWSER_MODE=login
+FEISHU_APP_ID=your_app_id
+FEISHU_APP_SECRET=your_app_secret
+FEISHU_BASE_APP_TOKEN=your_base_app_token
+FEISHU_TABLE_ID=your_table_id
+MONITOR_INTERVAL=10
+COMMENT_CHECK_MINUTES=5
+```
+
+### 4. 启动
+
+```powershell
+npm start
+```
+
+首次会弹出 Chrome，在窗口内登录淘宝直播中控台即可。
+
+### 5. Windows 下 Chrome 路径
+
+| 用途 | 路径 |
+|------|------|
+| 已安装 Chrome（常见） | `C:\Program Files\Google\Chrome\Application\chrome.exe` |
+| profile 模式用户数据 | `C:\Users\<用户名>\AppData\Local\Google\Chrome\User Data` |
+| login 模式登录态 | 项目目录 `chrome-data\` |
+
+### 6. CDP 模式（可选）
+
+先**完全退出**任务栏/托盘里的 Chrome，再在 **CMD** 中执行：
+
+```cmd
+"C:\Program Files\Google\Chrome\Application\chrome.exe" ^
+  --remote-debugging-port=9222 ^
+  --user-data-dir="%USERPROFILE%\chrome-debug-profile"
+```
+
+`.env`：
+
+```ini
+BROWSER_MODE=cdp
+CHROME_DEBUG_PORT=9222
+```
+
+### 7. 长期运行（Windows）
+
+**方式 A：pm2（推荐）**
+
+```powershell
+npm install -g pm2
+cd C:\path\to\taobao_live_data
+pm2 start npm --name taobao-live -- start
+pm2 save
+pm2 startup
+```
+
+**方式 B：计划任务**
+
+新建「登录时运行」任务，程序填 `node`，参数填项目内 `src\index.js` 的完整路径，起始于填项目目录。
+
+### 8. Windows 常见问题
+
+| 现象 | 处理 |
+|------|------|
+| `chrome-data` 被占用 | 任务管理器结束旧 `node.exe` / Chrome 后重试 |
+| 防火墙拦截 | 允许 Node.js、Chrome 访问网络 |
+| 电脑休眠 | 电源选项 → 关闭休眠/睡眠，或「从不」休眠 |
+| 路径含中文 | 项目尽量放在纯英文路径（如 `D:\tools\taobao_live_data`） |
 
 ---
 
@@ -166,6 +283,14 @@ CHROME_USER_DATA_DIR=
 /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
   --remote-debugging-port=9222 \
   --user-data-dir="$HOME/chrome-debug-profile"
+```
+
+**Windows 启动 Chrome：**
+
+```cmd
+"C:\Program Files\Google\Chrome\Application\chrome.exe" ^
+  --remote-debugging-port=9222 ^
+  --user-data-dir="%USERPROFILE%\chrome-debug-profile"
 ```
 
 ```bash
