@@ -215,4 +215,93 @@ async function findExistingRecordKeys(records) {
   return existingKeys;
 }
 
-module.exports = { writeRecord, writeBatchRecords, findExistingRecordKeys, buildFeishuFields };
+/**
+ * 按评论 key 查询飞书记录，用于补写订单
+ * @returns {Map<string, { recordId: string, orderId: string }>}
+ */
+async function findRecordsByKeys(records) {
+  const map = new Map();
+  if (!records || records.length === 0) return map;
+
+  const token = await getTenantAccessToken();
+  const { baseAppToken, tableId } = config.feishu;
+
+  for (const record of records) {
+    const key = `${record.commenterID}_${record.commentTime}_${record.commentContent}`;
+    try {
+      const filter = `AND(CurrentValue.[用户实际id]="${record.commenterID}",CurrentValue.[评论时间]="${record.commentTime}")`;
+      const res = await axios.get(
+        `${FEISHU_BASE}/bitable/v1/apps/${baseAppToken}/tables/${tableId}/records`,
+        {
+          params: {
+            filter,
+            page_size: 20,
+            field_names: JSON.stringify(['用户实际id', '评论时间', '用户评论', '订单编号']),
+          },
+          headers: { Authorization: `Bearer ${token}` },
+          timeout: REQUEST_TIMEOUT_MS,
+        }
+      );
+
+      if (res.data.code === 0 && res.data.data?.items) {
+        for (const item of res.data.data.items) {
+          const f = item.fields;
+          if (f['用户评论'] === record.commentContent) {
+            map.set(key, {
+              recordId: item.record_id,
+              orderId: String(f['订单编号'] || '').trim(),
+            });
+            break;
+          }
+        }
+      }
+    } catch (e) {
+      console.log(`[飞书] 查询记录失败 (${record.commenterID}):`, e.message);
+    }
+  }
+
+  return map;
+}
+
+/**
+ * 批量更新飞书记录（补写订单号/支付时间）
+ */
+async function updateBatchRecords(updates) {
+  if (!updates || updates.length === 0) return;
+
+  const token = await getTenantAccessToken();
+  const { baseAppToken, tableId } = config.feishu;
+
+  const batchRecords = updates.map(({ recordId, record }) => ({
+    record_id: recordId,
+    fields: buildFeishuFields(record),
+  }));
+
+  const res = await axios.post(
+    `${FEISHU_BASE}/bitable/v1/apps/${baseAppToken}/tables/${tableId}/records/batch_update`,
+    { records: batchRecords },
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: REQUEST_TIMEOUT_MS,
+    }
+  );
+
+  if (res.data.code !== 0) {
+    throw new Error(`批量更新飞书失败: ${JSON.stringify(res.data)}`);
+  }
+
+  console.log(`[飞书] 批量更新成功: ${updates.length} 条记录`);
+  return res.data;
+}
+
+module.exports = {
+  writeRecord,
+  writeBatchRecords,
+  updateBatchRecords,
+  findExistingRecordKeys,
+  findRecordsByKeys,
+  buildFeishuFields,
+};
