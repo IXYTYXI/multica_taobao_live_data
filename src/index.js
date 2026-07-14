@@ -18,13 +18,18 @@ const {
   launchBrowser,
   enterLiveRoom,
   findActivePage,
+  isPageUsable,
+  isRecoverablePageError,
+  isCommentPanelStale,
+  recoverControlPanel,
+  refreshControlPanelPage,
   dumpPageDOM,
   getRecentComments,
   scrollAndCollectAllComments,
   viewOrderForComment,
   nowBeijing,
 } = require('./browser');
-const { writeRecord, writeBatchRecords, findExistingRecordKeys } = require('./feishu');
+const { writeRecord, writeBatchRecords, updateBatchRecords, findExistingRecordKeys, findRecordsByKeys } = require('./feishu');
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -38,7 +43,13 @@ const ORDER_DEDUP_FILE = path.join(DATA_DIR, 'order-dedup.json');
 const OUTBOX_FILE = path.join(DATA_DIR, 'outbox.json');
 const STARTUP_BACKFILL_FILE = path.join(DATA_DIR, 'startup-backfill.json');
 const PERIODIC_BACKFILL_FILE = path.join(DATA_DIR, 'periodic-backfill.json');
+const RECOVERY_BACKFILL_FILE = path.join(DATA_DIR, 'recovery-backfill.json');
 const PERIODIC_BACKFILL_STATE_FILE = path.join(DATA_DIR, 'periodic-backfill-state.json');
+
+const RECOVERY_COOLDOWN_MS = 60000;
+let lastRecoveryAttemptMs = 0;
+let lastPageRefreshMs = Date.now();
+let consecutiveStaleScans = 0;
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -129,6 +140,14 @@ let pendingOutbox = loadOutbox();
 async function flushRecords(records, { isRetry = false } = {}) {
   if (records.length === 0) return;
 
+  const orderUpdates = records.filter((r) => r._feishuUpdate && r.orderId);
+  const creates = records.filter((r) => !r._feishuUpdate);
+  if (orderUpdates.length > 0) {
+    await flushOrderUpdates(orderUpdates);
+  }
+  if (creates.length === 0) return;
+  records = creates;
+
   // 按 key 去重：排除已确认 + 批次内去重（防同批重复发送）
   const sendMap = new Map();
   for (const r of records) {
@@ -204,6 +223,41 @@ async function flushRecords(records, { isRetry = false } = {}) {
   }
 }
 
+/**
+ * 对已写入飞书但缺订单号的评论，补写订单字段
+ */
+async function flushOrderUpdates(records) {
+  const existing = await findRecordsByKeys(records);
+  const toUpdate = [];
+
+  for (const r of records) {
+    const key = recordKey(r);
+    const found = existing.get(key);
+    if (!found) {
+      console.log(`[主程序] 补单: 飞书未找到评论 ${r.commenterName} ${r.commentTime}`);
+      continue;
+    }
+    if (found.orderId) {
+      console.log(`[主程序] 补单: ${r.commenterName} 已有订单 ${found.orderId}，跳过`);
+      continue;
+    }
+    toUpdate.push({ recordId: found.recordId, record: r });
+  }
+
+  if (toUpdate.length === 0) return;
+
+  try {
+    await updateBatchRecords(toUpdate);
+    for (const { record } of toUpdate) {
+      if (record.orderId) recordedOrderIds.add(record.orderId);
+    }
+    saveOrderDedup(recordedOrderIds);
+    console.log(`[主程序] 成功补写 ${toUpdate.length} 条订单到飞书`);
+  } catch (e) {
+    console.error('[主程序] 补写订单失败:', e.message);
+  }
+}
+
 function rebuildOutbox() {
   const outboxMap = new Map();
   for (const r of pendingOutbox) {
@@ -244,9 +298,17 @@ function isPeriodicBackfillDue() {
 
 /**
  * 将评论列表转为待写入记录（含查看订单）
+ * @param {{ mode?: 'monitor'|'backfill', onProgress?: Function }} opts
+ *   - monitor：仅处理未去重的新评论
+ *   - backfill：每条评论强制 viewOrderForComment（恢复/定时/启动兜底）
  */
-async function buildRecordsFromComments(page, comments, batchOrderIds, { onProgress } = {}) {
+async function buildRecordsFromComments(page, comments, batchOrderIds, { onProgress, mode = 'monitor' } = {}) {
+  const isBackfill = mode === 'backfill';
   const newRecords = [];
+
+  if (isBackfill) {
+    console.log(`[主程序] 兜底：将对 ${comments.length} 条评论逐条执行 viewOrderForComment`);
+  }
 
   for (let i = 0; i < comments.length; i++) {
     const comment = comments[i];
@@ -255,11 +317,16 @@ async function buildRecordsFromComments(page, comments, batchOrderIds, { onProgr
       commentTime: comment.time,
       commentContent: comment.content,
     });
-    if (recordedComments.has(key)) {
+    const alreadyRecorded = recordedComments.has(key);
+    if (alreadyRecorded && !isBackfill) {
       continue;
     }
 
-    console.log(`[主程序] 处理: ${comment.nickname}(${comment.userId}) ${comment.time} - ${comment.content}`);
+    if (alreadyRecorded) {
+      console.log(`[主程序] 补查订单: ${comment.nickname}(${comment.userId}) ${comment.time} - ${comment.content}`);
+    } else {
+      console.log(`[主程序] 处理: ${comment.nickname}(${comment.userId}) ${comment.time} - ${comment.content}`);
+    }
 
     const matchedOrder = await viewOrderForComment(page, comment);
     const { orderId, paymentTime, duplicate } = resolveOrderFields(
@@ -269,6 +336,23 @@ async function buildRecordsFromComments(page, comments, batchOrderIds, { onProgr
     );
     if (duplicate) {
       console.log(`[主程序] 订单 ${matchedOrder.orderId} 已记录，本条仅保存评论`);
+    }
+
+    if (alreadyRecorded) {
+      if (!orderId) continue;
+      newRecords.push({
+        commenterID: comment.userId,
+        commenterName: comment.nickname,
+        commentTime: comment.time,
+        commentContent: comment.content,
+        orderId,
+        paymentTime,
+        _feishuUpdate: true,
+      });
+      if (onProgress) {
+        await onProgress(i + 1, comments.length, newRecords);
+      }
+      continue;
     }
 
     const record = {
@@ -290,7 +374,8 @@ async function buildRecordsFromComments(page, comments, batchOrderIds, { onProgr
 }
 
 /**
- * 滚动全量扫描 → 落盘 → 查订单 → 写飞书（启动兜底与定时兜底共用）
+ * 滚动全量扫描 → 落盘 → 每条评论 viewOrderForComment → 写飞书
+ * 用于启动兜底、恢复兜底、定时兜底
  */
 async function runScrollBackfill(page, { label, snapshotFile, kind = 'backfill' }) {
   console.log(`[主程序] ========== ${label}：滚动全量扫描 ==========`);
@@ -337,6 +422,7 @@ async function runScrollBackfill(page, { label, snapshotFile, kind = 'backfill' 
 
   const batchOrderIds = new Set();
   const newRecords = await buildRecordsFromComments(page, comments, batchOrderIds, {
+    mode: 'backfill',
     onProgress: async (done, total, records) => {
       if (!snapshotFile) return;
       if (done % 5 === 0 || done === total) {
@@ -390,6 +476,50 @@ async function runScrollBackfill(page, { label, snapshotFile, kind = 'backfill' 
 }
 
 /**
+ * 浏览器关闭后恢复，并滚动兜底；每条评论强制 viewOrderForComment
+ */
+async function runRecoveryBackfill(page) {
+  await runScrollBackfill(page, {
+    label: '恢复兜底',
+    snapshotFile: RECOVERY_BACKFILL_FILE,
+    kind: 'recovery',
+  });
+}
+
+/**
+ * 尝试恢复浏览器会话；force=true 时跳过冷却（用于明确检测到页面关闭）
+ * @returns {Promise<import('playwright').Page|null>}
+ */
+async function tryRecoverSession(session, { force = false } = {}) {
+  if (!config.monitor.autoRecoverBrowser) {
+    console.log('[主程序] 页面不可用，自动恢复已关闭 (AUTO_RECOVER_BROWSER=false)');
+    return null;
+  }
+
+  const now = Date.now();
+  if (!force && now - lastRecoveryAttemptMs < RECOVERY_COOLDOWN_MS) {
+    console.log('[主程序] 恢复冷却中，稍后再试...');
+    return null;
+  }
+  lastRecoveryAttemptMs = now;
+
+  session.activePage = await recoverControlPanel(session);
+  await runRecoveryBackfill(session.activePage);
+  return session.activePage;
+}
+
+/**
+ * 确保当前有可用的中控台页面
+ * @returns {Promise<import('playwright').Page|null>}
+ */
+async function ensureActivePage(session) {
+  if (await isPageUsable(session.activePage)) {
+    return session.activePage;
+  }
+  return tryRecoverSession(session);
+}
+
+/**
  * 启动兜底：直播已在进行时，先滚动全量扫描历史评论
  */
 async function runStartupBackfill(page) {
@@ -410,7 +540,7 @@ async function runStartupBackfill(page) {
 }
 
 /**
- * 定时滚动兜底：每隔 N 小时滚动扫描，衔接虚拟列表，防止漏采
+ * 定时滚动兜底：每隔 N 小时滚动扫描；每条评论强制 viewOrderForComment
  */
 async function runPeriodicScrollBackfill(page) {
   const hours = config.monitor.periodicBackfillHours;
@@ -438,7 +568,21 @@ async function processNewComments(page) {
 
   if (result.error) {
     console.error('[主程序] 采集评论出错，跳过本轮:', result.error);
+    if (isRecoverablePageError(result.error)) return 'recover';
     return false;
+  }
+
+  if (isCommentPanelStale(result, page.url())) {
+    consecutiveStaleScans++;
+    console.log(
+      `[主程序] 评论区扫描异常 (${consecutiveStaleScans}/${config.monitor.staleScanThreshold})，` +
+        '页面可能卡死'
+    );
+    if (consecutiveStaleScans >= config.monitor.staleScanThreshold) {
+      return 'refresh';
+    }
+  } else {
+    consecutiveStaleScans = 0;
   }
 
   const allEntries = [...result.comments];
@@ -467,14 +611,21 @@ async function processNewComments(page) {
 /**
  * 主监控循环
  * 每轮周期性扫描评论区，对每条新评论尝试查看订单并写入飞书。
+ * 浏览器意外关闭时会自动重新打开并回到中控台。
  */
-async function monitorLoop(page) {
+async function monitorLoop(session) {
   const intervalMs = config.monitor.intervalSeconds * 1000;
 
   console.log(`[主程序] 开始监控，检查间隔: ${config.monitor.intervalSeconds}秒`);
   console.log(`[主程序] 评论检查范围: 最近 ${config.monitor.commentCheckMinutes} 分钟`);
   if (config.monitor.periodicBackfillHours > 0) {
     console.log(`[主程序] 定时滚动兜底: 每 ${config.monitor.periodicBackfillHours} 小时`);
+  }
+  if (config.monitor.autoRecoverBrowser) {
+    console.log('[主程序] 浏览器自动恢复: 已开启');
+  }
+  if (config.monitor.pageRefreshMinutes > 0) {
+    console.log(`[主程序] 定时页面刷新: 每 ${config.monitor.pageRefreshMinutes} 分钟`);
   }
   console.log(`[主程序] 当前北京时间: ${nowBeijing().format('YYYY-MM-DD HH:mm:ss')}`);
 
@@ -484,16 +635,50 @@ async function monitorLoop(page) {
     await flushRecords(pendingOutbox, { isRetry: true });
   }
 
-  await runStartupBackfill(page);
+  await runStartupBackfill(session.activePage);
 
   while (true) {
     try {
+      let page = await ensureActivePage(session);
+      if (!page) {
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+        continue;
+      }
+
       if (isPeriodicBackfillDue()) {
         await runPeriodicScrollBackfill(page);
+        page = session.activePage;
+      }
+
+      const refreshMinutes = config.monitor.pageRefreshMinutes;
+      if (refreshMinutes > 0) {
+        const refreshMs = refreshMinutes * 60 * 1000;
+        if (Date.now() - lastPageRefreshMs >= refreshMs) {
+          console.log(`[主程序] 到达定时刷新间隔 (${refreshMinutes} 分钟)，刷新中控台...`);
+          session.activePage = await refreshControlPanelPage(page);
+          page = session.activePage;
+          lastPageRefreshMs = Date.now();
+          consecutiveStaleScans = 0;
+        }
       }
 
       console.log(`[主程序] [${nowBeijing().format('HH:mm:ss')}] 扫描评论和订单...`);
-      await processNewComments(page);
+      const scanResult = await processNewComments(page);
+
+      if (scanResult === 'refresh') {
+        console.log('[主程序] 评论区异常，触发页面刷新...');
+        session.activePage = await refreshControlPanelPage(page);
+        lastPageRefreshMs = Date.now();
+        consecutiveStaleScans = 0;
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+        continue;
+      }
+
+      if (scanResult === 'recover') {
+        await tryRecoverSession(session, { force: true });
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+        continue;
+      }
 
       if (pendingOutbox.length > 0) {
         console.log(`[主程序] 重试 outbox 中 ${pendingOutbox.length} 条记录...`);
@@ -501,6 +686,9 @@ async function monitorLoop(page) {
       }
     } catch (e) {
       console.error(`[主程序] 监控循环异常: ${e.message}`);
+      if (isRecoverablePageError(e.message)) {
+        await tryRecoverSession(session, { force: true });
+      }
     }
 
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
@@ -526,6 +714,7 @@ async function main() {
   try {
     // 1. 启动/连接浏览器
     const { browser, context, page } = await launchBrowser();
+    const session = { browser, context, listPage: page, activePage: null };
 
     // 2. 进入直播间（未找到直播场次时持续重试，不关闭浏览器）
     // enterLiveRoom 返回中控台页面对象（可能是新标签页），失败返回 null
@@ -551,12 +740,14 @@ async function main() {
 
     // 4. 确认当前页面是中控台（防止在错误的标签页上运行）
     activePage = await findActivePage(activePage);
+    session.activePage = activePage;
+    session.listPage = page;
 
     // 5. 保存页面 DOM 用于调试（每次启动执行一次）
     await dumpPageDOM(activePage);
 
     // 6. 开始监控循环
-    await monitorLoop(activePage);
+    await monitorLoop(session);
   } catch (e) {
     console.error('[致命错误]', e.message);
     console.error(e.stack);

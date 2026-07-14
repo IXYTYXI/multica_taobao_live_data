@@ -379,6 +379,212 @@ async function launchForLogin() {
 // ─── 页面操作 ───────────────────────────────────────────────────────
 
 /**
+ * 判断错误是否由浏览器/页面关闭引起
+ */
+function isRecoverablePageError(message) {
+  if (!message) return false;
+  return /closed|Target page|context.*destroy|Browser has been closed|Protocol error/i.test(message);
+}
+
+/**
+ * 判断页面是否仍可用于采集
+ */
+async function isPageUsable(page) {
+  if (!page || page.isClosed()) return false;
+  try {
+    await page.evaluate(() => document.readyState);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 浏览器意外关闭后，重新打开并回到中控台
+ * @param {{ browser: import('playwright').Browser|null, context: import('playwright').BrowserContext, listPage: import('playwright').Page }} session
+ * @returns {Promise<import('playwright').Page>}
+ */
+async function recoverControlPanel(session) {
+  console.log('[浏览器] ⚠ 检测到浏览器/页面不可用，开始自动恢复...');
+
+  let { browser, context, listPage } = session;
+  let listPageUsable = listPage && !listPage.isClosed();
+
+  if (context) {
+    try {
+      const openPages = context.pages().filter((p) => !p.isClosed());
+      if (openPages.length > 0) {
+        listPage =
+          openPages.find((p) => p.url().includes('/live/list')) ||
+          openPages.find((p) => p.url().includes('liveplatform.taobao.com')) ||
+          openPages[0];
+        listPageUsable = true;
+        console.log('[浏览器] 现有 context 仍有可用标签页');
+      } else if (typeof context.newPage === 'function') {
+        try {
+          listPage = await context.newPage();
+          listPageUsable = true;
+          console.log('[浏览器] 在现有 context 中新建标签页');
+        } catch (e) {
+          console.log('[浏览器] 无法新建标签页:', e.message);
+          context = null;
+          listPageUsable = false;
+        }
+      }
+    } catch (e) {
+      console.log('[浏览器] context 已失效:', e.message);
+      context = null;
+      listPageUsable = false;
+    }
+  }
+
+  if (!context || !listPageUsable) {
+    console.log('[浏览器] 重新启动浏览器...');
+    if (context) {
+      try {
+        await context.close();
+      } catch {}
+    }
+    if (browser) {
+      try {
+        await browser.close();
+      } catch {}
+    }
+
+    const launched = await launchBrowser();
+    session.browser = launched.browser;
+    session.context = launched.context;
+    session.listPage = launched.page;
+    listPage = launched.page;
+  }
+
+  let activePage = null;
+  let attempts = 0;
+  const maxAttempts = 120;
+
+  while (!activePage && attempts < maxAttempts) {
+    attempts++;
+    try {
+      if (!listPage || listPage.isClosed()) {
+        listPage = await session.context.newPage();
+        session.listPage = listPage;
+      }
+      activePage = await enterLiveRoom(listPage);
+    } catch (e) {
+      console.log('[浏览器] 进入直播间失败:', e.message);
+      if (isRecoverablePageError(e.message)) {
+        listPage = null;
+      }
+    }
+
+    if (!activePage) {
+      console.log('[浏览器] 恢复：未找到直播场次，30 秒后重试...');
+      await new Promise((r) => setTimeout(r, 30000));
+      try {
+        if (listPage && !listPage.isClosed()) {
+          await listPage.goto(config.taobao.liveListUrl, { waitUntil: 'networkidle', timeout: 60000 });
+        }
+      } catch (e) {
+        console.log('[浏览器] 页面加载异常:', e.message);
+      }
+    }
+  }
+
+  if (!activePage) {
+    throw new Error('自动恢复失败：长时间未找到正在直播的场次');
+  }
+
+  console.log('[浏览器] 恢复：等待中控台数据加载...');
+  await new Promise((r) => setTimeout(r, 8000));
+
+  activePage = await findActivePage(activePage);
+  await pruneDuplicateControlTabs(activePage);
+  activePage = await refreshControlPanelPage(activePage);
+  session.activePage = activePage;
+  session.listPage = listPage;
+
+  console.log('[浏览器] ✓ 自动恢复完成');
+  return activePage;
+}
+
+/**
+ * 关闭多余的中控台/列表标签页，避免恢复后堆积
+ */
+async function pruneDuplicateControlTabs(keepPage) {
+  const context = keepPage.context();
+  const pages = context.pages().filter((p) => !p.isClosed());
+  const listPages = pages.filter((p) => p.url().includes('/live/list'));
+
+  for (const p of pages) {
+    if (p === keepPage) continue;
+    const url = p.url();
+    const isExtraControl = url.includes('/live/control');
+    const isExtraList = url.includes('/live/list') && listPages.length > 1;
+    if (!isExtraControl && !isExtraList) continue;
+    try {
+      await p.close();
+      console.log('[浏览器] 关闭多余标签页:', url.substring(0, 80));
+    } catch {}
+  }
+}
+
+/**
+ * 刷新中控台页面，修复评论区卡死/空白
+ */
+async function refreshControlPanelPage(page) {
+  const url = page.url();
+  if (!url.includes('/live/control')) {
+    console.log('[浏览器] 当前不在中控台，跳过刷新');
+    return page;
+  }
+
+  console.log('[浏览器] 刷新中控台页面...');
+  try {
+    await page.reload({ waitUntil: 'networkidle', timeout: 60000 });
+  } catch (e) {
+    console.log('[浏览器] reload 失败，尝试 goto:', e.message);
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 }).catch(() => {});
+  }
+
+  await page.waitForTimeout(8000);
+  await ensureCommentTab(page, '全部');
+  console.log('[浏览器] 中控台页面刷新完成');
+  return page;
+}
+
+/**
+ * 判断评论区是否处于异常/卡死状态（页面还在，但扫不到评论结构）
+ */
+function isCommentPanelStale(scanResult, pageUrl) {
+  if (!pageUrl?.includes('/live/control')) return false;
+  if (scanResult?.tabOk === false) return true;
+
+  const d = scanResult?.debug;
+  if (!d) return false;
+
+  if (d.bodyTextLength < 300) return true;
+
+  if (d.strategy !== 'none' || d.elementScanMatches > 0 || d.innerTextMatches > 0) {
+    return false;
+  }
+
+  const sampleLines = d.sampleLines || [];
+  const onlyMeta =
+    sampleLines.length > 0 &&
+    sampleLines.every(
+      (line) =>
+        line.includes('开播时间') ||
+        line.includes('更新时间') ||
+        line.includes('直播互动') ||
+        line.includes('全部') ||
+        line.includes('已下单')
+    );
+
+  if (onlyMeta && d.bodyTextLength < 2000) return false;
+  return d.bodyTextLength >= 800;
+}
+
+/**
  * 导航到直播列表并进入正在直播的场次
  *
  * 淘宝中控台的"直播详情"按钮会在新标签页中打开中控台。
@@ -858,9 +1064,9 @@ async function ensureCommentTab(page, tabText) {
   const active = await getActiveCommentTab(page);
   if (active === tabText) {
     console.log(`[浏览器] 已在"${tabText}"标签，跳过切换`);
-    return;
+    return { ok: true, alreadyActive: true };
   }
-  await clickCommentTab(page, tabText);
+  return await clickCommentTab(page, tabText);
 }
 
 /**
@@ -911,8 +1117,10 @@ async function clickCommentTab(page, tabText) {
     } else {
       console.log(`[浏览器] 未找到"${tabText}"标签 (container=${clicked.container})`);
     }
+    return { ok: clicked.clicked, container: clicked.container };
   } catch (e) {
     console.log(`[浏览器] 点击"${tabText}"标签失败:`, e.message);
+    return { ok: false, container: false };
   }
 }
 
@@ -1294,16 +1502,17 @@ async function getRecentComments(page, withinMinutes, { syncAllVisible = false }
   }
 
   const frame = await getContentFrame(page);
-  await ensureCommentTab(page, '全部');
+  const tabResult = await ensureCommentTab(page, '全部');
   if (syncAllVisible && config.monitor.scrollOnSync) {
     await scrollCommentList(page, frame);
     await page.waitForTimeout(2000);
   }
 
   const comments = [];
+  let rawComments = null;
 
   try {
-    let rawComments = await scanCommentsInFrame(frame);
+    rawComments = await scanCommentsInFrame(frame);
 
     if (syncAllVisible && rawComments.results.length === 0) {
       console.log('[浏览器] 首次扫描无评论，等待渲染后重试...');
@@ -1352,7 +1561,12 @@ async function getRecentComments(page, withinMinutes, { syncAllVisible = false }
   }
 
   console.log(`[浏览器] 获取到 ${comments.length} 条近期评论`);
-  return { comments, error: null };
+  return {
+    comments,
+    error: null,
+    debug: rawComments?.debug || null,
+    tabOk: tabResult?.ok !== false,
+  };
 }
 
 /**
@@ -1600,104 +1814,139 @@ async function extractAllOrders(page) {
 }
 
 /**
+ * 在评论列表中定位与 comment 匹配的 .tc-comment-item 元素
+ */
+async function findCommentItemHandle(frame, comment) {
+  const hm = comment.time.substring(11, 16);
+  const items = await frame.$$('.tc-comment-item');
+
+  for (const item of items) {
+    const matches = await item.evaluate(
+      (el, { userId, nickname, hm, content }) => {
+        const nameEl = el.querySelector('.tc-comment-item-userinfo-name');
+        const timeEl = el.querySelector('.alpw-comment-time');
+        const contentEl = el.querySelector('.tc-comment-item-content');
+        if (!nameEl || !timeEl) return false;
+
+        const nameText = (nameEl.textContent || '').trim();
+        const timeText = (timeEl.textContent || '').replace(/\s+/g, '').trim();
+        const contentText = (contentEl?.textContent || '').trim();
+        const contentSnippet = (content || '').trim().replace(/\[-[^\]]+\]/g, '').substring(0, 24);
+
+        if (!nameText.includes(nickname) || !nameText.includes(userId)) return false;
+        if (!timeText.includes(hm.replace(':', '')) && !timeText.includes(hm)) return false;
+        if (contentSnippet.length >= 2 && !contentText.includes(contentSnippet)) return false;
+        return true;
+      },
+      { userId: comment.userId, nickname: comment.nickname, hm, content: comment.content || '' }
+    );
+    if (matches) return item;
+  }
+  return null;
+}
+
+/**
+ * 虚拟列表中滚动查找评论行（兜底扫描后 DOM 里可能没有目标行）
+ */
+async function findCommentItemHandleWithScroll(frame, page, comment, maxSteps = 40) {
+  let item = await findCommentItemHandle(frame, comment);
+  if (item) return item;
+
+  for (let step = 0; step < maxSteps; step++) {
+    const moved = await frame.evaluate(() => {
+      function findScroller() {
+        for (const el of document.querySelectorAll('div, section, aside, *')) {
+          const text = el.textContent || '';
+          if (!text.includes('直播互动')) continue;
+          const style = window.getComputedStyle(el);
+          if (
+            (style.overflowY === 'auto' || style.overflowY === 'scroll') &&
+            el.scrollHeight > el.clientHeight + 30
+          ) {
+            return el;
+          }
+        }
+        return null;
+      }
+      const scroller = findScroller();
+      if (!scroller) return { moved: false, atTop: true };
+      const prev = scroller.scrollTop;
+      scroller.scrollTop = Math.max(0, scroller.scrollTop - Math.max(120, scroller.clientHeight * 0.6));
+      return { moved: scroller.scrollTop !== prev, atTop: scroller.scrollTop <= 0 };
+    });
+
+    await page.waitForTimeout(350);
+    item = await findCommentItemHandle(frame, comment);
+    if (item) return item;
+    if (!moved.moved && moved.atTop) break;
+  }
+
+  return null;
+}
+
+/**
  * 针对单条评论：悬停该行 → 点击「查看订单」→ 读取弹窗（无订单则返回 null）
  *
- * 订单与评论一一对应：每条评论都尝试查看，弹窗有数据则提取，没有则只记录评论。
+ * 使用 Playwright element.hover() 触发 CSS :hover，避免 page.mouse 坐标偏移导致按钮不显示。
  *
  * @returns {Object|null} 订单对象 { orderId, orderTime, paymentTime, productTitle }
  */
 async function viewOrderForComment(page, comment) {
   const frame = await getContentFrame(page);
-  const hm = comment.time.substring(11, 16); // HH:mm
+  const hm = comment.time.substring(11, 16);
 
-  const rowPos = await frame.evaluate(({ userId, nickname, hm, content }) => {
-    const contentSnippet = (content || '').trim().replace(/\[-[^\]]+\]/g, '').substring(0, 24);
+  let item = await findCommentItemHandle(frame, comment);
+  if (!item) {
+    item = await findCommentItemHandleWithScroll(frame, page, comment);
+  }
 
-    for (const item of document.querySelectorAll('.tc-comment-item')) {
-      const nameEl = item.querySelector('.tc-comment-item-userinfo-name');
-      const timeEl = item.querySelector('.alpw-comment-time');
-      const contentEl = item.querySelector('.tc-comment-item-content');
-      if (!nameEl || !timeEl) continue;
-
-      const nameText = (nameEl.textContent || '').trim();
-      const timeText = (timeEl.textContent || '').replace(/\s+/g, '').trim();
-      const contentText = (contentEl?.textContent || '').trim();
-
-      if (!nameText.includes(nickname) || !nameText.includes(userId)) continue;
-      if (!timeText.includes(hm.replace(':', '')) && !timeText.includes(hm)) continue;
-      if (contentSnippet.length >= 2 && !contentText.includes(contentSnippet)) continue;
-
-      const rect = item.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) continue;
-
-      return {
-        hoverX: rect.x + rect.width * 0.75,
-        hoverY: rect.y + rect.height / 2,
-        preview: `${nameText} ${timeText} ${contentText}`.substring(0, 100),
-      };
-    }
-    return null;
-  }, { userId: comment.userId, nickname: comment.nickname, hm, content: comment.content || '' });
-
-  if (!rowPos) {
+  if (!item) {
     console.log(`[浏览器] 未找到评论行: ${comment.nickname}(${comment.userId}) ${hm}`);
     return null;
   }
 
-  console.log(`[浏览器] 悬停评论: ${rowPos.preview}`);
-  await page.mouse.move(rowPos.hoverX, rowPos.hoverY);
-  await page.waitForTimeout(600);
+  const preview = await item.evaluate((el) => {
+    const name = el.querySelector('.tc-comment-item-userinfo-name')?.textContent?.trim() || '';
+    const time = el.querySelector('.alpw-comment-time')?.textContent?.trim() || '';
+    const content = el.querySelector('.tc-comment-item-content')?.textContent?.trim() || '';
+    return `${name} ${time} ${content}`.substring(0, 100);
+  });
+  console.log(`[浏览器] 悬停评论: ${preview}`);
 
-  let viewBtn = null;
-  for (let attempt = 0; attempt < 4; attempt++) {
-    viewBtn = await frame.evaluate(({ userId, nickname, hm, content }) => {
-      const contentSnippet = (content || '').trim().replace(/\[-[^\]]+\]/g, '').substring(0, 24);
+  await item.scrollIntoViewIfNeeded();
+  await page.waitForTimeout(300);
 
-      for (const item of document.querySelectorAll('.tc-comment-item')) {
-        const nameEl = item.querySelector('.tc-comment-item-userinfo-name');
-        const timeEl = item.querySelector('.alpw-comment-time');
-        const contentEl = item.querySelector('.tc-comment-item-content');
-        if (!nameEl || !timeEl) continue;
+  let orderBtn = null;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    await item.hover();
+    await page.waitForTimeout(attempt === 0 ? 700 : 450);
 
-        const nameText = (nameEl.textContent || '').trim();
-        const timeText = (timeEl.textContent || '').replace(/\s+/g, '').trim();
-        const contentText = (contentEl?.textContent || '').trim();
-
-        if (!nameText.includes(nickname) || !nameText.includes(userId)) continue;
-        if (!timeText.includes(hm.replace(':', '')) && !timeText.includes(hm)) continue;
-        if (contentSnippet.length >= 2 && !contentText.includes(contentSnippet)) continue;
-
-        const orderBtn = item.querySelector('[data-tblalog-id="chakandingdan"], img[alt="订单"]');
-        if (!orderBtn) continue;
-
-        const clickTarget = orderBtn.closest('.tc-comment-item-action') || orderBtn;
-        const rect = clickTarget.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) continue;
-
-        const container = item.querySelector('.tc-comment-item-action-container');
-        const containerStyle = container ? getComputedStyle(container) : null;
-        if (containerStyle && containerStyle.display === 'none') continue;
-
-        return {
-          x: rect.x + rect.width / 2,
-          y: rect.y + rect.height / 2,
-        };
+    orderBtn = await item.$('[data-tblalog-id="chakandingdan"]');
+    if (!orderBtn) {
+      orderBtn = await item.$('img[alt="订单"]');
+    }
+    if (!orderBtn) {
+      const actionWrap = await item.$('.tc-comment-item-action-container, .tc-comment-item-action');
+      if (actionWrap) {
+        await actionWrap.hover().catch(() => {});
+        await page.waitForTimeout(300);
+        orderBtn = await item.$('[data-tblalog-id="chakandingdan"], img[alt="订单"]');
       }
-      return null;
-    }, { userId: comment.userId, nickname: comment.nickname, hm, content: comment.content || '' });
-
-    if (viewBtn) break;
-    await page.mouse.move(rowPos.hoverX, rowPos.hoverY);
-    await page.waitForTimeout(400);
+    }
+    if (orderBtn) {
+      const visible = await orderBtn.isVisible().catch(() => false);
+      if (visible) break;
+      orderBtn = null;
+    }
   }
 
-  if (!viewBtn) {
+  if (!orderBtn) {
     console.log('[浏览器] 悬停后未出现「查看订单」按钮，按无订单处理');
     return null;
   }
 
   console.log('[浏览器] 点击「查看订单」');
-  await page.mouse.click(viewBtn.x, viewBtn.y);
+  await orderBtn.click();
   await page.waitForTimeout(2000);
 
   const orders = await extractOrdersFromPopup(page);
@@ -1719,6 +1968,11 @@ module.exports = {
   launchBrowser,
   enterLiveRoom,
   findActivePage,
+  isPageUsable,
+  isRecoverablePageError,
+  isCommentPanelStale,
+  recoverControlPanel,
+  refreshControlPanelPage,
   dumpPageDOM,
   debugScanPage,
   getTransactionCount,
