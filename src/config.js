@@ -49,6 +49,8 @@ const config = {
     scrollOnSync: process.env.SCROLL_ON_SYNC === 'true',
     // 启动兜底：直播已在进行时，先滚动全量扫描历史评论并落盘（默认开启）
     startupBackfill: process.env.STARTUP_BACKFILL !== 'false',
+    // 定时滚动兜底间隔（小时），防止虚拟列表衔接断层；0 表示关闭
+    periodicBackfillHours: parseFloat(process.env.PERIODIC_BACKFILL_HOURS || '3', 10),
   },
 };
 

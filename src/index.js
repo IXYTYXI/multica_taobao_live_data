@@ -10,6 +10,9 @@
  */
 const fs = require('fs');
 const path = require('path');
+const dayjs = require('dayjs');
+const utc = require('dayjs/plugin/utc');
+const timezone = require('dayjs/plugin/timezone');
 const config = require('./config');
 const {
   launchBrowser,
@@ -23,12 +26,19 @@ const {
 } = require('./browser');
 const { writeRecord, writeBatchRecords, findExistingRecordKeys } = require('./feishu');
 
+dayjs.extend(utc);
+dayjs.extend(timezone);
+
+const BEIJING_TZ = 'Asia/Shanghai';
+
 // ─── 持久化去重 + outbox ──────────────────────────────────────────
 const DATA_DIR = path.resolve(__dirname, '..', 'data');
 const DEDUP_FILE = path.join(DATA_DIR, 'dedup.json');
 const ORDER_DEDUP_FILE = path.join(DATA_DIR, 'order-dedup.json');
 const OUTBOX_FILE = path.join(DATA_DIR, 'outbox.json');
 const STARTUP_BACKFILL_FILE = path.join(DATA_DIR, 'startup-backfill.json');
+const PERIODIC_BACKFILL_FILE = path.join(DATA_DIR, 'periodic-backfill.json');
+const PERIODIC_BACKFILL_STATE_FILE = path.join(DATA_DIR, 'periodic-backfill-state.json');
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -207,6 +217,30 @@ function rebuildOutbox() {
 }
 
 let initialCommentSyncDone = false;
+let lastPeriodicBackfillMs = 0;
+
+function loadLastPeriodicBackfillMs() {
+  const data = loadJSON(PERIODIC_BACKFILL_STATE_FILE);
+  if (data?.lastRunAt) {
+    const d = dayjs.tz(data.lastRunAt, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+    if (d.isValid()) return d.valueOf();
+  }
+  return 0;
+}
+
+function saveLastPeriodicBackfillMs(ms = Date.now()) {
+  lastPeriodicBackfillMs = ms;
+  atomicWrite(PERIODIC_BACKFILL_STATE_FILE, {
+    lastRunAt: dayjs(ms).tz(BEIJING_TZ).format('YYYY-MM-DD HH:mm:ss'),
+  });
+}
+
+function isPeriodicBackfillDue() {
+  const hours = config.monitor.periodicBackfillHours;
+  if (!hours || hours <= 0) return false;
+  if (!lastPeriodicBackfillMs) lastPeriodicBackfillMs = loadLastPeriodicBackfillMs();
+  return Date.now() - lastPeriodicBackfillMs >= hours * 3600 * 1000;
+}
 
 /**
  * 将评论列表转为待写入记录（含查看订单）
@@ -256,7 +290,107 @@ async function buildRecordsFromComments(page, comments, batchOrderIds, { onProgr
 }
 
 /**
- * 启动兜底：直播已在进行时，先滚动全量扫描历史评论，落盘后再查订单并写入飞书
+ * 滚动全量扫描 → 落盘 → 查订单 → 写飞书（启动兜底与定时兜底共用）
+ */
+async function runScrollBackfill(page, { label, snapshotFile, kind = 'backfill' }) {
+  console.log(`[主程序] ========== ${label}：滚动全量扫描 ==========`);
+
+  let comments = [];
+  try {
+    const result = await scrollAndCollectAllComments(page);
+    comments = result.comments || [];
+  } catch (e) {
+    console.error(`[主程序] ${label}扫描失败:`, e.message);
+    return { ok: false, writtenCount: 0, commentCount: 0 };
+  }
+
+  const scannedAt = dayjs().tz(BEIJING_TZ).format('YYYY-MM-DD HH:mm:ss');
+  if (snapshotFile) {
+    atomicWrite(snapshotFile, {
+      version: 1,
+      kind,
+      stage: 'scanned',
+      scannedAt,
+      commentCount: comments.length,
+      comments,
+      records: [],
+    });
+    console.log(`[主程序] ${label}评论已落盘: ${snapshotFile} (${comments.length} 条)`);
+  }
+
+  if (comments.length === 0) {
+    if (snapshotFile) {
+      atomicWrite(snapshotFile, {
+        version: 1,
+        kind,
+        stage: 'done',
+        scannedAt,
+        commentCount: 0,
+        comments: [],
+        records: [],
+        finishedAt: scannedAt,
+      });
+    }
+    console.log(`[主程序] ${label}完成（无评论）`);
+    return { ok: true, writtenCount: 0, commentCount: 0 };
+  }
+
+  const batchOrderIds = new Set();
+  const newRecords = await buildRecordsFromComments(page, comments, batchOrderIds, {
+    onProgress: async (done, total, records) => {
+      if (!snapshotFile) return;
+      if (done % 5 === 0 || done === total) {
+        atomicWrite(snapshotFile, {
+          version: 1,
+          kind,
+          stage: 'processing',
+          scannedAt,
+          commentCount: comments.length,
+          comments,
+          processedCount: done,
+          records,
+        });
+        console.log(`[主程序] ${label}处理进度: ${done}/${total}`);
+      }
+    },
+  });
+
+  if (snapshotFile) {
+    atomicWrite(snapshotFile, {
+      version: 1,
+      kind,
+      stage: 'processed',
+      scannedAt,
+      commentCount: comments.length,
+      comments,
+      records: newRecords,
+      processedAt: dayjs().tz(BEIJING_TZ).format('YYYY-MM-DD HH:mm:ss'),
+    });
+  }
+
+  if (newRecords.length > 0) {
+    console.log(`[主程序] ${label}：写入 ${newRecords.length} 条记录到飞书...`);
+    await flushRecords(newRecords);
+  }
+
+  if (snapshotFile) {
+    atomicWrite(snapshotFile, {
+      version: 1,
+      kind,
+      stage: 'done',
+      scannedAt,
+      commentCount: comments.length,
+      writtenCount: newRecords.length,
+      finishedAt: dayjs().tz(BEIJING_TZ).format('YYYY-MM-DD HH:mm:ss'),
+    });
+  }
+
+  console.log(`[主程序] ========== ${label}完成（扫描 ${comments.length} 条，新写入 ${newRecords.length} 条）==========`);
+  return { ok: true, writtenCount: newRecords.length, commentCount: comments.length };
+}
+
+/**
+ * 启动兜底：直播已在进行时，先滚动全量扫描历史评论
  */
 async function runStartupBackfill(page) {
   if (!config.monitor.startupBackfill) {
@@ -265,89 +399,30 @@ async function runStartupBackfill(page) {
     return;
   }
 
-  console.log('[主程序] ========== 启动兜底：扫描直播已开始后的历史评论 ==========');
-
-  let comments = [];
-  try {
-    const result = await scrollAndCollectAllComments(page);
-    comments = result.comments || [];
-  } catch (e) {
-    console.error('[主程序] 启动兜底扫描失败:', e.message);
-    initialCommentSyncDone = true;
-    return;
-  }
-
-  const scannedAt = nowBeijing().format('YYYY-MM-DD HH:mm:ss');
-  atomicWrite(STARTUP_BACKFILL_FILE, {
-    version: 1,
-    stage: 'scanned',
-    scannedAt,
-    commentCount: comments.length,
-    comments,
-    records: [],
-  });
-  console.log(`[主程序] 历史评论已落盘: ${STARTUP_BACKFILL_FILE} (${comments.length} 条)`);
-
-  if (comments.length === 0) {
-    atomicWrite(STARTUP_BACKFILL_FILE, {
-      version: 1,
-      stage: 'done',
-      scannedAt,
-      commentCount: 0,
-      comments: [],
-      records: [],
-      finishedAt: scannedAt,
-    });
-    initialCommentSyncDone = true;
-    console.log('[主程序] 启动兜底完成（无历史评论）');
-    return;
-  }
-
-  const batchOrderIds = new Set();
-  const newRecords = await buildRecordsFromComments(page, comments, batchOrderIds, {
-    onProgress: async (done, total, records) => {
-      if (done % 5 === 0 || done === total) {
-        atomicWrite(STARTUP_BACKFILL_FILE, {
-          version: 1,
-          stage: 'processing',
-          scannedAt,
-          commentCount: comments.length,
-          comments,
-          processedCount: done,
-          records,
-        });
-        console.log(`[主程序] 兜底处理进度: ${done}/${total}`);
-      }
-    },
-  });
-
-  atomicWrite(STARTUP_BACKFILL_FILE, {
-    version: 1,
-    stage: 'processed',
-    scannedAt,
-    commentCount: comments.length,
-    comments,
-    records: newRecords,
-    processedAt: nowBeijing().format('YYYY-MM-DD HH:mm:ss'),
-  });
-  console.log(`[主程序] 兜底记录已落盘: ${newRecords.length} 条待写入`);
-
-  if (newRecords.length > 0) {
-    console.log(`[主程序] 兜底：写入 ${newRecords.length} 条记录到飞书...`);
-    await flushRecords(newRecords);
-  }
-
-  atomicWrite(STARTUP_BACKFILL_FILE, {
-    version: 1,
-    stage: 'done',
-    scannedAt,
-    commentCount: comments.length,
-    writtenCount: newRecords.length,
-    finishedAt: nowBeijing().format('YYYY-MM-DD HH:mm:ss'),
+  await runScrollBackfill(page, {
+    label: '启动兜底',
+    snapshotFile: STARTUP_BACKFILL_FILE,
+    kind: 'startup',
   });
 
   initialCommentSyncDone = true;
-  console.log('[主程序] ========== 启动兜底完成，进入常规监控 ==========');
+  saveLastPeriodicBackfillMs();
+}
+
+/**
+ * 定时滚动兜底：每隔 N 小时滚动扫描，衔接虚拟列表，防止漏采
+ */
+async function runPeriodicScrollBackfill(page) {
+  const hours = config.monitor.periodicBackfillHours;
+  if (!hours || hours <= 0) return;
+
+  await runScrollBackfill(page, {
+    label: `定时兜底(${hours}h)`,
+    snapshotFile: PERIODIC_BACKFILL_FILE,
+    kind: 'periodic',
+  });
+
+  saveLastPeriodicBackfillMs();
 }
 
 /**
@@ -398,6 +473,9 @@ async function monitorLoop(page) {
 
   console.log(`[主程序] 开始监控，检查间隔: ${config.monitor.intervalSeconds}秒`);
   console.log(`[主程序] 评论检查范围: 最近 ${config.monitor.commentCheckMinutes} 分钟`);
+  if (config.monitor.periodicBackfillHours > 0) {
+    console.log(`[主程序] 定时滚动兜底: 每 ${config.monitor.periodicBackfillHours} 小时`);
+  }
   console.log(`[主程序] 当前北京时间: ${nowBeijing().format('YYYY-MM-DD HH:mm:ss')}`);
 
   // 启动时重试 outbox 中残留的失败记录（先远端对账防重复）
@@ -410,6 +488,10 @@ async function monitorLoop(page) {
 
   while (true) {
     try {
+      if (isPeriodicBackfillDue()) {
+        await runPeriodicScrollBackfill(page);
+      }
+
       console.log(`[主程序] [${nowBeijing().format('HH:mm:ss')}] 扫描评论和订单...`);
       await processNewComments(page);
 
