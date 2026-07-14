@@ -58,6 +58,8 @@
 
 很多人以为 **clone → 改 `.env` → `npm start`** 就能「全部配置成功」。实际上这只覆盖**启动采集进程**；其他环节需单独准备或执行。
 
+<a id="deploy-checklist"></a>
+
 ### 对照表
 
 | # | 配置 / 步骤 | 改 `.env` + `npm start` 是否足够 | 详见（含可复制命令） |
@@ -84,6 +86,8 @@
 
 仅在 `BROWSER_MODE=cdp` 时，需手动用调试端口启动 Chrome（见 [浏览器模式](#浏览器模式)）。
 
+<a id="deploy-goals"></a>
+
 ### 三种部署目标
 
 | 目标 | 跳转 |
@@ -91,6 +95,8 @@
 | **A. 临时试跑** | [一键复制：从零到可采集](#deploy-quick-a) |
 | **B. 长期采集（手动启停）** | A + [步骤 7：pm2 守护](#deploy-step-pm2) |
 | **C. 每天固定时段自动启停** | B + [步骤 8：定时启停](#deploy-step-schedule) |
+
+[↑ 返回对照表](#deploy-checklist)
 
 ---
 
@@ -222,11 +228,13 @@ pm2 startup
 
 ## 快速部署（完整清单）
 
-按顺序勾选，**全部打勾后再认为部署完成**。
+按顺序勾选，**全部打勾后再认为部署完成**。各步骤下方可 [↑ 返回对照表](#deploy-checklist) 查看整体进度。
 
 <a id="deploy-step-0"></a>
 
 ### 阶段 0：机器环境（clone 之前）
+
+> ↑ [返回对照表](#deploy-checklist)（对应 **②** Node.js · **④** Chrome）
 
 - [ ] 已安装 **Node.js ≥ 18**
 - [ ] 已安装 **Google Chrome**（非 Edge/Firefox；工具指定 `channel: 'chrome'`）
@@ -272,6 +280,8 @@ winget install Google.Chrome
 
 ### 1. 获取代码
 
+> ↑ [返回对照表](#deploy-checklist)（对应 **③** npm 项目依赖）
+
 ```bash
 git clone https://github.com/IXYTYXI/multica_taobao_live_data.git
 cd multica_taobao_live_data
@@ -297,6 +307,8 @@ npm install
 <a id="deploy-step-env"></a>
 
 ### 3. 配置环境变量
+
+> ↑ [返回对照表](#deploy-checklist)（对应 **①** 飞书凭证、采集间隔）
 
 ```bash
 cp .env.example .env
@@ -351,6 +363,8 @@ COMMENT_CHECK_MINUTES=5
 
 ### 4. 准备飞书多维表格
 
+> ↑ [返回对照表](#deploy-checklist)（对应 **⑥** 飞书应用权限与表格列）
+
 目标数据表需包含以下字段（列名须一致）：
 
 | 字段名 | 类型 | 写入内容 |
@@ -380,6 +394,8 @@ COMMENT_CHECK_MINUTES=5
 <a id="deploy-step-start"></a>
 
 ### 5. 首次启动（阶段 2：验证采集）
+
+> ↑ [返回对照表](#deploy-checklist)（对应 **①** 启动生效 · **⑤** 首次淘宝登录）
 
 - [ ] 已在项目根目录执行 `npm start`
 - [ ] 已在弹出 Chrome 中**手动完成**淘宝/直播中控台登录（仅首次或 Cookie 过期时）
@@ -411,6 +427,8 @@ npm start
 
 ### 7. 可选：pm2 守护（阶段 3：长期运行）
 
+> ↑ [返回对照表](#deploy-checklist)（对应 **⑦** 长期后台运行）
+
 若需进程崩溃自动拉起、或配合定时启停，需**额外**配置 pm2（`npm start` 不会自动完成）：
 
 - [ ] 已全局安装 pm2：`npm install -g pm2`
@@ -434,6 +452,8 @@ pm2 stop taobao-live    # 停止
 <a id="deploy-step-schedule"></a>
 
 ### 8. 可选：每日定时启停（阶段 4）
+
+> ↑ [返回对照表](#deploy-checklist)（对应 **⑧** 每天定时启停）
 
 **仅在需要每天固定时段采集时配置。** 在 `.env` 写好时间后，必须单独执行 `schedule:install`：
 
@@ -459,6 +479,8 @@ npm run schedule:status
 
 ### 一键复制：从零到可采集（目标 A）
 
+> ↑ [返回对照表](#deploy-checklist) · [三种部署目标 A](#deploy-goals)
+
 ```bash
 # 前提：本机已装 Node.js ≥ 18、Google Chrome
 git clone https://github.com/IXYTYXI/multica_taobao_live_data.git
@@ -473,6 +495,8 @@ npm start
 <a id="deploy-quick-c"></a>
 
 ### 一键复制：从零到定时采集（目标 C）
+
+> ↑ [返回对照表](#deploy-checklist) · [三种部署目标 C](#deploy-goals)
 
 ```bash
 git clone https://github.com/IXYTYXI/multica_taobao_live_data.git
@@ -756,6 +780,8 @@ scripts\windows\schedule-stop.bat
 <a id="deploy-step-startup"></a>
 
 ### 使用 pm2 守护（推荐）
+
+> ↑ [返回对照表](#deploy-checklist)（对应 **⑨** 7×24 开机自启）
 
 ```bash
 npm install -g pm2
