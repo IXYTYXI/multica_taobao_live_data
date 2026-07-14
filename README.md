@@ -47,15 +47,10 @@
 | 浏览器 | **Google Chrome**（非 Chromium 包） | 工具通过 Playwright `channel: 'chrome'` 调用本机 Chrome |
 | 操作系统 | Windows 10/11 或 macOS | Linux 未专门测试；Windows 见下方专节 |
 | 网络 | 可访问淘宝直播中控台与飞书 Open API | 公司网络需放行相关域名 |
-| 飞书 | 企业自建应用 + 多维表格授权 | 见 [快速部署](#快速部署完整清单) 第 4 步 |
+| 飞书 | 企业自建应用 + 多维表格授权 | 见 [步骤 4：飞书表格](#deploy-step-feishu) |
 | Git | 可选 | 用于 `git clone`；也可直接下载 ZIP |
 
-验证 Node.js 是否就绪：
-
-```bash
-node -v   # 应 ≥ v18.0.0
-npm -v
-```
+验证 Node.js 是否就绪见 [阶段 0：机器环境](#deploy-step-0)。
 
 ---
 
@@ -65,131 +60,19 @@ npm -v
 
 ### 对照表
 
-| # | 配置 / 步骤 | 改 `.env` + `npm start` 是否足够 |
-|---|-------------|----------------------------------|
-| ① | 飞书凭证、采集间隔等 | ✅ |
-| ② | Node.js 运行环境 | ❌ |
-| ③ | npm 项目依赖 | ❌ |
-| ④ | Google Chrome | ❌ |
-| ⑤ | 首次淘宝登录 | ❌ |
-| ⑥ | 飞书应用权限与表格列 | ❌ |
-| ⑦ | 长期后台运行（pm2） | ❌ |
-| ⑧ | 每天定时启停 | ❌ |
-| ⑨ | 7×24 开机自启 | ❌ |
+| # | 配置 / 步骤 | 改 `.env` + `npm start` 是否足够 | 详见（含可复制命令） |
+|---|-------------|----------------------------------|----------------------|
+| ① | 飞书凭证、采集间隔等 | ✅ | [步骤 3：配置 .env](#deploy-step-env) → [步骤 5：启动](#deploy-step-start) |
+| ② | Node.js 运行环境 | ❌ | [阶段 0：安装 Node.js](#deploy-step-0) |
+| ③ | npm 项目依赖 | ❌ | [步骤 1–2：clone 与 install](#deploy-step-clone) |
+| ④ | Google Chrome | ❌ | [阶段 0：安装 Chrome](#deploy-step-0) |
+| ⑤ | 首次淘宝登录 | ❌ | [步骤 5：首次启动](#deploy-step-start) |
+| ⑥ | 飞书应用权限与表格列 | ❌ | [步骤 4：飞书表格](#deploy-step-feishu) |
+| ⑦ | 长期后台运行（pm2） | ❌ | [步骤 7：pm2 守护](#deploy-step-pm2) |
+| ⑧ | 每天定时启停 | ❌ | [步骤 8：定时启停](#deploy-step-schedule) |
+| ⑨ | 7×24 开机自启 | ❌ | [长期运行：pm2 startup](#deploy-step-startup) |
 
-### 对应命令（按编号复制执行）
-
-**① 飞书凭证、采集间隔**（改完后 `npm start` 即生效）
-
-```bash
-cp .env.example .env
-# 编辑 .env，至少填入 FEISHU_APP_ID / FEISHU_APP_SECRET / FEISHU_BASE_APP_TOKEN / FEISHU_TABLE_ID
-nano .env          # macOS / Linux
-# notepad .env     # Windows
-npm start
-```
-
-**② Node.js 运行环境**（需 ≥ 18，安装后验证）
-
-```bash
-node -v   # 应显示 v18.x 或更高
-npm -v
-```
-
-未安装时：
-
-```bash
-# macOS（Homebrew）
-brew install node
-
-# Windows（winget）
-winget install OpenJS.NodeJS.LTS
-```
-
-或从 [Node.js 官网](https://nodejs.org/) 下载 LTS 安装包。
-
-**③ npm 项目依赖**
-
-```bash
-git clone https://github.com/IXYTYXI/multica_taobao_live_data.git
-cd multica_taobao_live_data
-npm install
-```
-
-GitLab 镜像：
-
-```bash
-git clone https://gitlab.yc345.tv/fengyang1/taobao_live_data.git
-cd taobao_live_data
-npm install
-```
-
-**④ Google Chrome**（用本机 Chrome，**不需要** `npx playwright install chromium`）
-
-```bash
-# macOS（Homebrew）
-brew install --cask google-chrome
-
-# Windows（winget）
-winget install Google.Chrome
-```
-
-或从 [Google Chrome 官网](https://www.google.com/chrome/) 安装。`.env` 保持默认即可：
-
-```env
-BROWSER_MODE=login
-```
-
-**⑤ 首次淘宝登录**（在弹出浏览器中手动操作，仅需首次或 Cookie 过期时）
-
-```bash
-npm start
-# → 在弹出的 Chrome 窗口内登录淘宝直播中控台
-# → 登录成功后工具自动进入直播列表并开始监控
-```
-
-**⑥ 飞书应用权限与表格列**（在飞书开放平台操作，无 CLI）
-
-1. 创建企业自建应用，拿到 `App ID` / `App Secret`
-2. 开通多维表格读写权限（`bitable:app` 等）
-3. 将目标 Base 授权给该应用
-4. 在表格中手动添加列：用户ID、用户实际id、评论时间、用户评论、订单编号、支付时间
-
-详细字段说明见 [快速部署 §4](#4-准备飞书多维表格)。
-
-**⑦ 长期后台运行（pm2）**
-
-```bash
-npm install -g pm2
-pm2 start npm --name taobao-live -- start
-pm2 save
-pm2 logs taobao-live    # 查看日志
-pm2 restart taobao-live # 重启
-pm2 stop taobao-live    # 停止
-```
-
-**⑧ 每天定时启停**（需先完成 ⑦；`.env` 写好时间后单独安装）
-
-```bash
-# .env 中配置（示例）
-# SCHEDULE_ENABLED=true
-# SCHEDULE_START_TIME=08:00
-# SCHEDULE_STOP_TIME=00:06
-# SCHEDULE_PM2_NAME=taobao-live
-
-npm run schedule:install
-npm run schedule:status
-```
-
-**⑨ 7×24 开机自启**（与 ⑧ 定时启停二选一，适合全天采集）
-
-```bash
-npm install -g pm2
-pm2 start npm --name taobao-live -- start
-pm2 save
-pm2 startup   # 按终端提示复制并执行它输出的命令
-pm2 save
-```
+> 命令均在下文 [快速部署（完整清单）](#快速部署完整清单) 对应步骤中，此处只做索引跳转，避免重复。
 
 ### 关于 Chrome 与 Chromium
 
@@ -203,11 +86,11 @@ pm2 save
 
 ### 三种部署目标
 
-| 目标 | 最少步骤 |
-|------|----------|
-| **A. 临时试跑** | 装 Node + Chrome → `npm install` → 改 `.env` → `npm start` |
-| **B. 长期采集（手动启停）** | A + `pm2 start npm --name taobao-live -- start` |
-| **C. 每天固定时段自动启停** | B + `.env` 配 `SCHEDULE_*` → `npm run schedule:install` |
+| 目标 | 跳转 |
+|------|------|
+| **A. 临时试跑** | [一键复制：从零到可采集](#deploy-quick-a) |
+| **B. 长期采集（手动启停）** | A + [步骤 7：pm2 守护](#deploy-step-pm2) |
+| **C. 每天固定时段自动启停** | B + [步骤 8：定时启停](#deploy-step-schedule) |
 
 ---
 
@@ -341,16 +224,51 @@ pm2 startup
 
 按顺序勾选，**全部打勾后再认为部署完成**。
 
+<a id="deploy-step-0"></a>
+
 ### 阶段 0：机器环境（clone 之前）
 
-- [ ] 已安装 **Node.js ≥ 18**（`node -v` 验证）
+- [ ] 已安装 **Node.js ≥ 18**
 - [ ] 已安装 **Google Chrome**（非 Edge/Firefox；工具指定 `channel: 'chrome'`）
 - [ ] 网络可访问 `liveplatform.taobao.com` 与飞书 Open API
 - [ ] （可选）已安装 Git，用于 clone
 - [ ] （Windows 建议）项目放在**纯英文路径**（如 `D:\tools\taobao_live_data`）
 - [ ] 直播期间机器**不休眠**（电源选项关闭睡眠/休眠）
 
+**验证 Node.js：**
+
+```bash
+node -v   # 应 ≥ v18.0.0
+npm -v
+```
+
+**未安装 Node.js 时：**
+
+```bash
+# macOS（Homebrew）
+brew install node
+
+# Windows（winget）
+winget install OpenJS.NodeJS.LTS
+```
+
+或从 [Node.js 官网](https://nodejs.org/) 下载 LTS 安装包。
+
+**安装 Google Chrome**（**不需要** `npx playwright install chromium`）：
+
+```bash
+# macOS（Homebrew）
+brew install --cask google-chrome
+
+# Windows（winget）
+winget install Google.Chrome
+```
+
+或从 [Google Chrome 官网](https://www.google.com/chrome/) 安装。
+
 ### 阶段 1：获取代码与依赖
+
+<a id="deploy-step-clone"></a>
 
 ### 1. 获取代码
 
@@ -374,7 +292,9 @@ npm install
 
 安装 `playwright`、`axios`、`dotenv` 等 Node 依赖。**无需**额外修改项目内 JS 配置。
 
-> **说明**：运行时调用本机 Google Chrome，**通常不需要** `npx playwright install chromium`。若报 Chrome 找不到，请先安装 Chrome。
+> **说明**：运行时调用本机 Google Chrome，**通常不需要** `npx playwright install chromium`。若报 Chrome 找不到，见 [阶段 0](#deploy-step-0)。
+
+<a id="deploy-step-env"></a>
 
 ### 3. 配置环境变量
 
@@ -427,6 +347,8 @@ COMMENT_CHECK_MINUTES=5
 
 > **注意**：`.env` 含敏感信息，勿提交到 Git。完整变量说明见 [配置说明](#配置说明) 与 `.env.example`。
 
+<a id="deploy-step-feishu"></a>
+
 ### 4. 准备飞书多维表格
 
 目标数据表需包含以下字段（列名须一致）：
@@ -454,6 +376,8 @@ COMMENT_CHECK_MINUTES=5
 #### 授权表格
 
 在飞书开放平台 → 应用 → 权限管理 → 多维表格，将目标 Base 授权给该应用。
+
+<a id="deploy-step-start"></a>
 
 ### 5. 首次启动（阶段 2：验证采集）
 
@@ -483,6 +407,8 @@ npm start
 - 工具会在评论行上悬停并点击「查看订单」，属于正常行为
 - 直播进行中建议保持 `SCROLL_ON_SYNC` 未开启（默认 `false`），避免滚动干扰界面
 
+<a id="deploy-step-pm2"></a>
+
 ### 7. 可选：pm2 守护（阶段 3：长期运行）
 
 若需进程崩溃自动拉起、或配合定时启停，需**额外**配置 pm2（`npm start` 不会自动完成）：
@@ -496,11 +422,16 @@ npm start
 npm install -g pm2
 pm2 start npm --name taobao-live -- start
 pm2 save
+pm2 logs taobao-live    # 查看日志
+pm2 restart taobao-live # 重启
+pm2 stop taobao-live    # 停止
 ```
 
 进程名需与 `.env` 中 `SCHEDULE_PM2_NAME`（默认 `taobao-live`）一致。
 
-若需 **7×24 开机自启**，再执行 `pm2 startup`（与下方「定时启停」二选一，见 [长期运行](#长期运行724)）。
+若需 **7×24 开机自启**，见 [长期运行：pm2 startup](#deploy-step-startup)（与下方定时启停二选一）。
+
+<a id="deploy-step-schedule"></a>
 
 ### 8. 可选：每日定时启停（阶段 4）
 
@@ -524,6 +455,8 @@ npm run schedule:status
 
 详见 [定时启停](#定时启停0800-启动--0006-停止) 专节。
 
+<a id="deploy-quick-a"></a>
+
 ### 一键复制：从零到可采集（目标 A）
 
 ```bash
@@ -536,6 +469,8 @@ cp .env.example .env
 npm start
 # 在弹出 Chrome 中完成首次登录
 ```
+
+<a id="deploy-quick-c"></a>
 
 ### 一键复制：从零到定时采集（目标 C）
 
@@ -818,6 +753,8 @@ scripts\windows\schedule-stop.bat
 | 不关闭采集用 Chrome | 关闭后报 `page has been closed` |
 | 进程守护 | Node 崩溃后需自动拉起 |
 
+<a id="deploy-step-startup"></a>
+
 ### 使用 pm2 守护（推荐）
 
 ```bash
@@ -827,6 +764,7 @@ cd /path/to/multica_taobao_live_data
 pm2 start npm --name taobao-live -- start
 pm2 save
 pm2 startup   # 按提示配置开机自启
+pm2 save
 ```
 
 常用命令：
