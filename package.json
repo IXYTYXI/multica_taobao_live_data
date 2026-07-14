@@ -5,7 +5,10 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "test": "jest --verbose --forceExit"
+    "test": "jest --verbose --forceExit",
+    "schedule:install": "node scripts/setup-schedule.js install",
+    "schedule:uninstall": "node scripts/setup-schedule.js uninstall",
+    "schedule:status": "node scripts/setup-schedule.js status"
   },
   "dependencies": {
     "axios": "^1.7.0",

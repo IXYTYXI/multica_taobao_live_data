@@ -4,6 +4,22 @@
 
 适用于**单场或全天直播**场景：工具会持续运行，每隔固定间隔扫描评论区，对新评论逐条尝试「查看订单」，将结果同步到飞书。
 
+**目录**
+
+- [功能概览](#功能概览)
+- [环境要求](#环境要求)
+- [Windows 部署说明](#windows-部署说明)
+- [快速部署](#快速部署)
+- [浏览器模式](#浏览器模式)
+- [配置说明](#配置说明)
+- [定时启停](#定时启停0800-启动--0006-停止)
+- [长期运行（7×24）](#长期运行724)
+- [本地数据文件](#本地数据文件)
+- [故障排查](#故障排查)
+- [项目结构](#项目结构)
+- [npm 脚本](#npm-脚本)
+- [开发与测试](#开发与测试)
+
 ---
 
 ## 功能概览
@@ -14,8 +30,11 @@
 | 评论采集 | 在「全部」标签扫描评论，不来回切换「已下单」等筛选 |
 | 查看订单 | 悬停评论行 → 点击「查看订单」→ 读取弹窗中的订单编号与支付时间 |
 | 订单去重 | 同一订单号只保留一条带订单的记录（用户下单后后续评论可能重复带出同一订单） |
-| 飞书写入 | 批量写入多维表格，失败记录进入 outbox 自动重试 |
+| 飞书写入 | 批量写入多维表格；已有评论可补写订单号；失败记录进入 outbox 自动重试 |
 | 本地去重 | `dedup.json` / `order-dedup.json` 持久化，重启不重复写入 |
+| 启动 / 定时兜底 | 启动时全量回溯评论；每 N 小时滚动兜底，防止虚拟列表漏采 |
+| 浏览器自愈 | 页面意外关闭时自动重开并回到中控台；定时刷新防止评论区卡死 |
+| 跨平台定时启停 | 自动识别 macOS / Windows，从 `.env` 配置每日启停时间 |
 
 ---
 
@@ -123,19 +142,28 @@ CHROME_DEBUG_PORT=9222
 
 ### 7. 长期运行（Windows）
 
-**方式 A：pm2（推荐）**
+**方式 A：pm2 + 定时启停（推荐，见下方「定时启停」专节）**
 
 ```powershell
 npm install -g pm2
 cd C:\path\to\taobao_live_data
 pm2 start npm --name taobao-live -- start
 pm2 save
-pm2 startup
 ```
 
-**方式 B：计划任务**
+**不要**执行 `pm2 startup` 做 24 小时开机自启；若只需每天固定时段采集，在项目根目录配置 `.env` 后执行：
 
-新建「登录时运行」任务，程序填 `node`，参数填项目内 `src\index.js` 的完整路径，起始于填项目目录。
+```powershell
+npm run schedule:install
+```
+
+详见下方「定时启停」专节。
+
+**方式 B：仅 pm2 7×24 守护**
+
+```powershell
+pm2 startup
+```
 
 ### 8. Windows 常见问题
 
@@ -242,6 +270,21 @@ npm start
 - 工具会在评论行上悬停并点击「查看订单」，属于正常行为
 - 直播进行中建议保持 `SCROLL_ON_SYNC` 未开启（默认 `false`），避免滚动干扰界面
 
+### 7. 可选：配置每日定时启停
+
+若直播固定在每天某时段（如 08:00–00:06），无需 7×24 运行，可在 `.env` 中设置 `SCHEDULE_*` 变量后执行：
+
+```bash
+npm install -g pm2
+pm2 start npm --name taobao-live -- start
+pm2 save
+
+npm run schedule:install
+npm run schedule:status
+```
+
+详见 [定时启停](#定时启停0800-启动--0006-停止) 专节。
+
 ---
 
 ## 浏览器模式
@@ -304,6 +347,8 @@ CHROME_DEBUG_PORT=9222
 
 ## 配置说明
 
+### 飞书与浏览器
+
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `FEISHU_APP_ID` | 飞书应用 App ID | — |
@@ -313,20 +358,190 @@ CHROME_DEBUG_PORT=9222
 | `BROWSER_MODE` | `login` / `profile` / `cdp` | `login` |
 | `CHROME_USER_DATA_DIR` | profile 模式 Chrome 目录 | 自动检测 |
 | `CHROME_DEBUG_PORT` | cdp 模式调试端口 | `9222` |
+| `LOCAL_BROWSER_DATA_DIR` | login 模式浏览器数据目录 | 项目下 `chrome-data/` |
+
+### 采集与监控
+
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
 | `MONITOR_INTERVAL` | 监控间隔（秒） | `10` |
 | `COMMENT_CHECK_MINUTES` | 每轮扫描的时间窗口（分钟） | `5` |
-| `SCROLL_ON_SYNC` | 首次同步是否滚动评论列表 | `false`（未设置即 false） |
+| `SCROLL_ON_SYNC` | 首次同步是否滚动评论列表 | `false` |
+| `STARTUP_BACKFILL` | 启动时全量回溯历史评论并查订单 | `true` |
+| `PERIODIC_BACKFILL_HOURS` | 定时滚动兜底间隔（小时）；`0` 关闭 | `3` |
+| `AUTO_RECOVER_BROWSER` | 浏览器意外关闭后自动恢复 | `true` |
+| `PAGE_REFRESH_MINUTES` | 定时刷新中控台（分钟）；`0` 关闭 | `30` |
+| `STALE_SCAN_THRESHOLD` | 连续 N 轮扫描异常后触发刷新 | `3` |
+
+### 定时启停
+
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| `SCHEDULE_ENABLED` | 是否允许 `schedule:install` 写入系统任务 | `true` |
+| `SCHEDULE_START_TIME` | 每天启动时间（`HH:mm`） | `08:00` |
+| `SCHEDULE_STOP_TIME` | 每天停止时间（`HH:mm`） | `00:06` |
+| `SCHEDULE_PM2_NAME` | pm2 进程名（与 `pm2 start --name` 一致） | `taobao-live` |
+
+完整模板见 `.env.example`。
 
 ### 采集逻辑说明
 
 - **首次进入中控台**：同步当前可见的全部评论（不受 `COMMENT_CHECK_MINUTES` 限制）
+- **启动兜底**（`STARTUP_BACKFILL=true`）：若直播已在进行，滚动「直播互动」评论列表全量回溯，逐条查订单；飞书已有记录则补写订单号
 - **后续每轮**：只处理「最近 N 分钟」内的新评论（N = `COMMENT_CHECK_MINUTES`）
 - **每条新评论**：悬停 → 点「查看订单」→ 有订单则写入，无则只写评论
 - **同一 `orderId`**：全表只保留一条带订单的记录
+- **定时兜底**（`PERIODIC_BACKFILL_HOURS`）：每隔若干小时再次滚动全量，衔接虚拟列表防止漏采
+- **页面维护**：定时刷新 + 连续扫描异常时刷新；浏览器关闭时自动重开并跑恢复兜底
+
+---
+
+## 定时启停（08:00 启动 / 00:06 停止）
+
+适用于**每天固定时段直播**（例如 8:00 开播、次日凌晨停采集），无需 7×24 运行。
+
+| 时间 | 动作 |
+|------|------|
+| 每天 **08:00** | 启动采集 |
+| 每天 **00:06** | 停止采集（优雅退出，保存 dedup/outbox） |
+
+运行时段示意：`08:00 ──► 采集中 ──► 次日 00:06 ──► 休眠至 08:00`
+
+### 推荐：自动识别平台 + `.env` 配置（一条命令安装）
+
+脚本 `scripts/setup-schedule.js` 会**自动识别 macOS / Windows**，从 `.env` 读取启停时间，并写入 **cron**（Mac）或 **任务计划程序**（Windows）。
+
+1. 在 `.env` 中配置（可复制 `.env.example` 中对应段落）：
+
+```env
+SCHEDULE_ENABLED=true
+SCHEDULE_START_TIME=08:00
+SCHEDULE_STOP_TIME=00:06
+SCHEDULE_PM2_NAME=taobao-live
+```
+
+2. 完成下方「前置：pm2 一次性配置」后，在项目根目录执行：
+
+```bash
+npm run schedule:install    # 安装/更新系统定时任务
+npm run schedule:status     # 查看当前配置与任务状态
+npm run schedule:uninstall  # 卸载定时任务
+```
+
+| 命令 | 作用 |
+|------|------|
+| `schedule:install` | macOS 写入 crontab 标记块；Windows 创建 `TaobaoLive-Start` / `TaobaoLive-Stop` |
+| `schedule:status` | 打印平台、时间、PM2 名称及任务是否已安装 |
+| `schedule:uninstall` | 移除上述定时任务 |
+
+修改 `.env` 中的时间后，重新执行 `npm run schedule:install` 即可生效。启停脚本会从 `.env` 读取 `SCHEDULE_PM2_NAME`（默认 `taobao-live`）。
+
+> 日志默认写入系统临时目录下的 `taobao-live-schedule.log`（macOS 一般为 `/tmp/taobao-live-schedule.log`）。
+
+### 前置：pm2 一次性配置
+
+```bash
+npm install -g pm2
+cd /path/to/taobao_live_data   # 或 multica_taobao_live_data
+pm2 start npm --name taobao-live -- start
+pm2 save
+```
+
+> **不要**执行 `pm2 startup`（那是开机 24 小时自启）。启停交给下方系统定时任务。
+
+### macOS（cron，手动配置）
+
+> 若已使用 `npm run schedule:install`，可跳过本节。
+
+1. 赋予脚本执行权限（首次）：
+
+```bash
+chmod +x scripts/macos/schedule-start.sh scripts/macos/schedule-stop.sh
+```
+
+2. 编辑 crontab：
+
+```bash
+crontab -e
+```
+
+3. 加入（**将 `/path/to/multica_taobao_live_data` 改为你本机项目绝对路径**）：
+
+```cron
+# 每天 08:00 启动
+0 8 * * * /path/to/multica_taobao_live_data/scripts/macos/schedule-start.sh >> /tmp/taobao-live-schedule.log 2>&1
+
+# 每天 00:06 停止
+6 0 * * * /path/to/multica_taobao_live_data/scripts/macos/schedule-stop.sh >> /tmp/taobao-live-schedule.log 2>&1
+```
+
+4. 确认 `pm2` 路径可用（`which pm2`）；cron 环境变量较少，脚本已自动补充 `/usr/local/bin` 与 `/opt/homebrew/bin`。
+
+5. 若任务不执行：系统设置 → 隐私与安全性 → 为「终端」或 `cron` 授予完全磁盘访问权限。
+
+**脚本位置：**
+
+| 脚本 | 作用 |
+|------|------|
+| `scripts/macos/schedule-start.sh` | 从 `.env` 读 PM2 名，`pm2 restart/start` |
+| `scripts/macos/schedule-stop.sh` | `pm2 stop` + 关闭 `chrome-data` Chrome |
+
+### Windows（任务计划程序，手动配置）
+
+> 若已使用 `npm run schedule:install`，可跳过本节。
+
+1. 打开 **任务计划程序** → 创建任务（非「基本任务」以便填起始于）。
+
+2. **启动任务**（每天 08:00）：
+
+| 项 | 值 |
+|----|-----|
+| 名称 | `TaobaoLive-Start` |
+| 触发器 | 每天 08:00 |
+| 操作 | 启动程序 |
+| 程序 | `C:\path\to\taobao_live_data\scripts\windows\schedule-start.bat` |
+| 起始于 | `C:\path\to\taobao_live_data` |
+| 条件 | 取消「只有在计算机使用交流电源时才启动」 |
+| 设置 | 勾选「如果过了计划开始时间，立即启动任务」 |
+
+3. **停止任务**（每天 00:06）：
+
+| 项 | 值 |
+|----|-----|
+| 名称 | `TaobaoLive-Stop` |
+| 触发器 | 每天 00:06 |
+| 操作 | 启动程序 |
+| 程序 | `C:\path\to\taobao_live_data\scripts\windows\schedule-stop.bat` |
+| 起始于 | `C:\path\to\taobao_live_data` |
+
+4. 勾选「不管用户是否登录都要运行」；运行账户需已安装 Node.js 与 pm2。
+
+**脚本位置：**
+
+| 脚本 | 作用 |
+|------|------|
+| `scripts\windows\schedule-start.bat` | 从 `.env` 读 PM2 名，`pm2 restart/start` |
+| `scripts\windows\schedule-stop.bat` | `pm2 stop` + 关闭 `chrome-data` Chrome |
+
+### 手动测试
+
+```bash
+# macOS
+./scripts/macos/schedule-start.sh
+./scripts/macos/schedule-stop.sh
+```
+
+```powershell
+# Windows
+scripts\windows\schedule-start.bat
+scripts\windows\schedule-stop.bat
+```
 
 ---
 
 ## 长期运行（7×24）
+
+> 若只需每天固定时段采集，优先使用上方 [定时启停](#定时启停0800-启动--0006-停止)（`npm run schedule:install`），无需 `pm2 startup` 开机自启。
 
 工具主循环为 `while (true)`，设计上支持整场直播甚至全天运行，但需满足：
 
@@ -388,6 +603,8 @@ pm2 stop taobao-live    # 停止
 | 登录态失效 | Cookie 过期 | 删除 `chrome-data/` 后重新 `npm start` 登录 |
 | 找不到直播场次 | 当前无「直播中」 | 工具每 30 秒重试，开播后自动进入 |
 | CDP 连不上 | 9222 未监听 | 完全退出 Chrome 后用 `--remote-debugging-port=9222` 启动 |
+| 定时任务未执行 | cron / 任务计划未安装或权限不足 | 执行 `npm run schedule:status` 检查；macOS 给终端/cron 完全磁盘访问 |
+| 定时启动后 pm2 找不到 | cron 环境 PATH 不含 npm 全局 bin | 脚本已补充常见路径；确认 `which pm2` 可用 |
 
 ---
 
@@ -396,16 +613,36 @@ pm2 stop taobao-live    # 停止
 ```
 multica_taobao_live_data/
 ├── src/
-│   ├── index.js      # 主入口：监控循环、去重、outbox
-│   ├── browser.js    # Playwright：登录、进中控台、采评论/订单
-│   ├── feishu.js     # 飞书 API：写入与远端对账
-│   └── config.js     # 环境变量加载
-├── __tests__/        # 单元测试
-├── data/             # 运行时数据（不提交 Git）
-├── chrome-data/      # login 模式浏览器数据（不提交 Git）
-├── .env.example      # 环境变量模板
+│   ├── index.js           # 主入口：监控循环、兜底、去重、outbox
+│   ├── browser.js         # Playwright：登录、进中控台、采评论/订单
+│   ├── feishu.js          # 飞书 API：写入、补写订单、远端对账
+│   └── config.js          # 环境变量加载
+├── scripts/
+│   ├── setup-schedule.js  # 跨平台定时任务安装器（macOS cron / Windows 任务计划）
+│   ├── macos/
+│   │   ├── schedule-start.sh
+│   │   └── schedule-stop.sh
+│   └── windows/
+│       ├── schedule-start.bat
+│       └── schedule-stop.bat
+├── __tests__/             # 单元测试
+├── data/                  # 运行时数据（不提交 Git）
+├── chrome-data/           # login 模式浏览器数据（不提交 Git）
+├── .env.example           # 环境变量模板
 └── package.json
 ```
+
+---
+
+## npm 脚本
+
+| 命令 | 说明 |
+|------|------|
+| `npm start` | 启动采集主进程 |
+| `npm test` | 运行单元测试 |
+| `npm run schedule:install` | 从 `.env` 读取时间，安装系统定时启停任务 |
+| `npm run schedule:status` | 查看平台、配置与任务安装状态 |
+| `npm run schedule:uninstall` | 卸载系统定时启停任务 |
 
 ---
 

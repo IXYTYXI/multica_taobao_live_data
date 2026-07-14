@@ -58,6 +58,14 @@ const config = {
     // 连续 N 轮扫描异常后触发刷新（默认 3）
     staleScanThreshold: parseInt(process.env.STALE_SCAN_THRESHOLD || '3', 10),
   },
+
+  // 定时启停（由 npm run schedule:install 写入系统计划任务）
+  schedule: {
+    enabled: process.env.SCHEDULE_ENABLED !== 'false',
+    startTime: (process.env.SCHEDULE_START_TIME || '08:00').trim(),
+    stopTime: (process.env.SCHEDULE_STOP_TIME || '00:06').trim(),
+    pm2Name: (process.env.SCHEDULE_PM2_NAME || 'taobao-live').trim(),
+  },
 };
 
 module.exports = config;
