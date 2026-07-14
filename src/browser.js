@@ -1152,56 +1152,23 @@ function parseCommentTime(timeStr) {
  * 首次同步时滚动评论列表，尽量加载虚拟列表中的历史评论
  */
 async function scrollCommentList(page, frame) {
-  const scrolled = await frame.evaluate(async () => {
-    function findInteractionRoot() {
-      let best = null;
-      let bestScore = 0;
-      for (const el of document.querySelectorAll('div, section, aside')) {
-        const text = el.textContent || '';
-        if (!text.includes('直播互动') || !text.includes('全部')) continue;
-        const rect = el.getBoundingClientRect();
-        if (rect.width === 0 || rect.height < 280) continue;
-        if (rect.left > window.innerWidth * 0.55) continue;
-        const score = rect.height * rect.width;
-        if (score > bestScore) {
-          bestScore = score;
-          best = el;
-        }
-      }
-      return best || document.body;
-    }
+  console.log('[浏览器] 在直播互动评论列表内滚动加载...');
+  await scrollCommentListStep(frame, 'end');
+  await page.waitForTimeout(200);
 
-    const root = findInteractionRoot();
-    const scrollables = [];
-    for (const el of root.querySelectorAll('*')) {
-      const style = window.getComputedStyle(el);
-      if (
-        (style.overflowY === 'auto' || style.overflowY === 'scroll') &&
-        el.scrollHeight > el.clientHeight + 30
-      ) {
-        scrollables.push(el);
-      }
+  for (let i = 0; i < 80; i++) {
+    const s = await scrollCommentListStep(frame, 'up');
+    if (!s.found) {
+      console.log('[浏览器] 未找到评论列表滚动容器');
+      break;
     }
-    scrollables.sort((a, b) => b.scrollHeight - a.scrollHeight);
-    const scroller = scrollables[0];
-    if (!scroller) return { scrolled: false, rootTextLength: (root.innerText || '').length };
-
-    const step = Math.max(scroller.clientHeight * 0.8, 120);
-    scroller.scrollTop = scroller.scrollHeight;
-    await new Promise((r) => setTimeout(r, 200));
-    for (let pos = scroller.scrollHeight; pos >= 0; pos -= step) {
-      scroller.scrollTop = pos;
-      await new Promise((r) => setTimeout(r, 120));
-    }
-    scroller.scrollTop = 0;
-    await new Promise((r) => setTimeout(r, 200));
-    return { scrolled: true, rootTextLength: (root.innerText || '').length, scrollHeight: scroller.scrollHeight };
-  });
-  if (scrolled.scrolled) {
-    console.log(`[浏览器] 已滚动评论列表 (scrollHeight=${scrolled.scrollHeight}, 区域文本=${scrolled.rootTextLength}字)`);
-  } else {
-    console.log(`[浏览器] 未找到可滚动评论列表 (区域文本=${scrolled.rootTextLength}字)`);
+    await page.waitForTimeout(120);
+    if (s.atTop) break;
   }
+
+  await scrollCommentListStep(frame, 'end');
+  await page.waitForTimeout(200);
+  console.log('[浏览器] 评论列表滚动完成');
   await page.waitForTimeout(400);
 }
 
@@ -1356,7 +1323,10 @@ function rawScanResultsToComments(rawResults, cutoff = null) {
   return comments;
 }
 
-/** 滚动评论列表一步（用于全量扫描） */
+/**
+ * 在「直播互动」评论列表内滚动一步（不滚主页面）
+ * 优先定位包含 .tc-comment-item 的 scroll 容器
+ */
 async function scrollCommentListStep(frame, direction = 'down') {
   return frame.evaluate((dir) => {
     function findInteractionRoot() {
@@ -1366,35 +1336,66 @@ async function scrollCommentListStep(frame, direction = 'down') {
         const text = el.textContent || '';
         if (!text.includes('直播互动') || !text.includes('全部')) continue;
         const rect = el.getBoundingClientRect();
-        if (rect.width === 0 || rect.height < 280 || rect.left > window.innerWidth * 0.55) continue;
+        if (rect.width === 0 || rect.height < 280) continue;
+        if (rect.left > window.innerWidth * 0.55) continue;
         const score = rect.height * rect.width;
         if (score > bestScore) {
           bestScore = score;
           best = el;
         }
       }
-      return best || document.body;
+      return best;
     }
 
-    const root = findInteractionRoot();
-    const scrollables = [];
-    for (const el of root.querySelectorAll('*')) {
-      const style = window.getComputedStyle(el);
-      if (
-        (style.overflowY === 'auto' || style.overflowY === 'scroll') &&
-        el.scrollHeight > el.clientHeight + 30
-      ) {
-        scrollables.push(el);
+    /** 评论列表滚动容器：含 .tc-comment-item 的 scroll 区域，非整页 */
+    function findCommentListScroller() {
+      const sample = document.querySelector('.tc-comment-item');
+      if (sample) {
+        let el = sample.parentElement;
+        while (el) {
+          const style = window.getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          if (
+            (style.overflowY === 'auto' || style.overflowY === 'scroll') &&
+            el.scrollHeight > el.clientHeight + 30 &&
+            rect.width > 0 &&
+            rect.left < window.innerWidth * 0.6
+          ) {
+            return el;
+          }
+          el = el.parentElement;
+        }
       }
+
+      const root = findInteractionRoot();
+      if (!root) return null;
+
+      let best = null;
+      let bestCount = 0;
+      for (const el of root.querySelectorAll('*')) {
+        const style = window.getComputedStyle(el);
+        if (!(style.overflowY === 'auto' || style.overflowY === 'scroll')) continue;
+        if (el.scrollHeight <= el.clientHeight + 30) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.left > window.innerWidth * 0.55) continue;
+        const count = el.querySelectorAll('.tc-comment-item').length;
+        if (count > bestCount) {
+          bestCount = count;
+          best = el;
+        }
+      }
+      return best;
     }
-    scrollables.sort((a, b) => b.scrollHeight - a.scrollHeight);
-    const scroller = scrollables[0];
+
+    const scroller = findCommentListScroller();
     if (!scroller) return { found: false };
 
     const step = Math.max(scroller.clientHeight * 0.75, 120);
     const prevTop = scroller.scrollTop;
     if (dir === 'up') {
       scroller.scrollTop = Math.max(0, scroller.scrollTop - step);
+    } else if (dir === 'end') {
+      scroller.scrollTop = scroller.scrollHeight;
     } else {
       scroller.scrollTop = Math.min(scroller.scrollHeight, scroller.scrollTop + step);
     }
@@ -1406,8 +1407,40 @@ async function scrollCommentListStep(frame, direction = 'down') {
       atEnd: scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 5,
       scrollTop: scroller.scrollTop,
       scrollHeight: scroller.scrollHeight,
+      commentItems: scroller.querySelectorAll('.tc-comment-item').length,
     };
   }, direction);
+}
+
+/**
+ * 将评论行滚入评论列表可视区（只滚评论列表，不滚主页面）
+ */
+async function scrollCommentItemIntoView(page, itemHandle) {
+  await itemHandle.evaluate((itemEl) => {
+    let scroller = null;
+    let el = itemEl.parentElement;
+    while (el) {
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      if (
+        (style.overflowY === 'auto' || style.overflowY === 'scroll') &&
+        el.scrollHeight > el.clientHeight + 30 &&
+        rect.width > 0 &&
+        rect.left < window.innerWidth * 0.6
+      ) {
+        scroller = el;
+        break;
+      }
+      el = el.parentElement;
+    }
+    if (!scroller) return;
+
+    const itemRect = itemEl.getBoundingClientRect();
+    const scrollerRect = scroller.getBoundingClientRect();
+    const relTop = itemRect.top - scrollerRect.top + scroller.scrollTop;
+    scroller.scrollTop = Math.max(0, relTop - scroller.clientHeight / 2);
+  });
+  await page.waitForTimeout(200);
 }
 
 /**
@@ -1465,25 +1498,8 @@ async function scrollAndCollectAllComments(page) {
     if (!scroll.moved && scroll.atEnd) break;
   }
 
-  // 滚回底部，便于后续监控新评论
-  await frame.evaluate(() => {
-    function findScroller() {
-      for (const el of document.querySelectorAll('div, section, aside, *')) {
-        const text = el.textContent || '';
-        if (!text.includes('直播互动')) continue;
-        const style = window.getComputedStyle(el);
-        if (
-          (style.overflowY === 'auto' || style.overflowY === 'scroll') &&
-          el.scrollHeight > el.clientHeight + 30
-        ) {
-          return el;
-        }
-      }
-      return null;
-    }
-    const scroller = findScroller();
-    if (scroller) scroller.scrollTop = scroller.scrollHeight;
-  });
+  // 滚回评论列表底部，便于后续监控新评论（不滚主页面）
+  await scrollCommentListStep(frame, 'end');
   await page.waitForTimeout(400);
 
   const comments = [...merged.values()].sort((a, b) => a.time.localeCompare(b.time));
@@ -1853,32 +1869,12 @@ async function findCommentItemHandleWithScroll(frame, page, comment, maxSteps = 
   if (item) return item;
 
   for (let step = 0; step < maxSteps; step++) {
-    const moved = await frame.evaluate(() => {
-      function findScroller() {
-        for (const el of document.querySelectorAll('div, section, aside, *')) {
-          const text = el.textContent || '';
-          if (!text.includes('直播互动')) continue;
-          const style = window.getComputedStyle(el);
-          if (
-            (style.overflowY === 'auto' || style.overflowY === 'scroll') &&
-            el.scrollHeight > el.clientHeight + 30
-          ) {
-            return el;
-          }
-        }
-        return null;
-      }
-      const scroller = findScroller();
-      if (!scroller) return { moved: false, atTop: true };
-      const prev = scroller.scrollTop;
-      scroller.scrollTop = Math.max(0, scroller.scrollTop - Math.max(120, scroller.clientHeight * 0.6));
-      return { moved: scroller.scrollTop !== prev, atTop: scroller.scrollTop <= 0 };
-    });
-
+    const scroll = await scrollCommentListStep(frame, 'up');
+    if (!scroll.found) break;
     await page.waitForTimeout(350);
     item = await findCommentItemHandle(frame, comment);
     if (item) return item;
-    if (!moved.moved && moved.atTop) break;
+    if (!scroll.moved && scroll.atTop) break;
   }
 
   return null;
@@ -1913,7 +1909,7 @@ async function viewOrderForComment(page, comment) {
   });
   console.log(`[浏览器] 悬停评论: ${preview}`);
 
-  await item.scrollIntoViewIfNeeded();
+  await scrollCommentItemIntoView(page, item);
   await page.waitForTimeout(300);
 
   let orderBtn = null;
