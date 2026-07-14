@@ -17,6 +17,7 @@ const {
   findActivePage,
   dumpPageDOM,
   getRecentComments,
+  scrollAndCollectAllComments,
   viewOrderForComment,
   nowBeijing,
 } = require('./browser');
@@ -27,6 +28,7 @@ const DATA_DIR = path.resolve(__dirname, '..', 'data');
 const DEDUP_FILE = path.join(DATA_DIR, 'dedup.json');
 const ORDER_DEDUP_FILE = path.join(DATA_DIR, 'order-dedup.json');
 const OUTBOX_FILE = path.join(DATA_DIR, 'outbox.json');
+const STARTUP_BACKFILL_FILE = path.join(DATA_DIR, 'startup-backfill.json');
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -207,40 +209,18 @@ function rebuildOutbox() {
 let initialCommentSyncDone = false;
 
 /**
- * 扫描近期评论，处理新条目
- *
- * 1. 仅在"全部"标签扫描，不来回切换标签
- * 2. 首次进入中控台同步当前可见的全部评论
- * 3. 每条新评论：悬停该行 → 点「查看订单」→ 有则写入订单，无则只写评论
- * 4. 同一订单号只保留一条带订单的记录（用户下单后后续评论可能重复带出同一订单）
+ * 将评论列表转为待写入记录（含查看订单）
  */
-async function processNewComments(page) {
-  const syncAllVisible = !initialCommentSyncDone;
-  const result = await getRecentComments(page, config.monitor.commentCheckMinutes, { syncAllVisible });
-  initialCommentSyncDone = true;
-
-  if (result.error) {
-    console.error('[主程序] 采集评论出错，跳过本轮:', result.error);
-    return false;
-  }
-
-  const allEntries = [...result.comments];
-
-  if (allEntries.length === 0) {
-    console.log('[主程序] 近期无新评论或订单');
-    return true;
-  }
-
-  const orderEntryCount = allEntries.filter(e => e.content && e.content.includes('已下单')).length;
-  if (orderEntryCount > 0) {
-    console.log(`[主程序] 本轮含 ${orderEntryCount} 条带「已下单」标记的评论（仅供参考）`);
-  }
-
+async function buildRecordsFromComments(page, comments, batchOrderIds, { onProgress } = {}) {
   const newRecords = [];
-  const batchOrderIds = new Set();
 
-  for (const comment of allEntries) {
-    const key = `${comment.userId}_${comment.time}_${comment.content}`;
+  for (let i = 0; i < comments.length; i++) {
+    const comment = comments[i];
+    const key = recordKey({
+      commenterID: comment.userId,
+      commentTime: comment.time,
+      commentContent: comment.content,
+    });
     if (recordedComments.has(key)) {
       continue;
     }
@@ -267,7 +247,139 @@ async function processNewComments(page) {
     };
 
     newRecords.push(record);
+    if (onProgress) {
+      await onProgress(i + 1, comments.length, newRecords);
+    }
   }
+
+  return newRecords;
+}
+
+/**
+ * 启动兜底：直播已在进行时，先滚动全量扫描历史评论，落盘后再查订单并写入飞书
+ */
+async function runStartupBackfill(page) {
+  if (!config.monitor.startupBackfill) {
+    console.log('[主程序] 启动兜底已关闭 (STARTUP_BACKFILL=false)');
+    initialCommentSyncDone = true;
+    return;
+  }
+
+  console.log('[主程序] ========== 启动兜底：扫描直播已开始后的历史评论 ==========');
+
+  let comments = [];
+  try {
+    const result = await scrollAndCollectAllComments(page);
+    comments = result.comments || [];
+  } catch (e) {
+    console.error('[主程序] 启动兜底扫描失败:', e.message);
+    initialCommentSyncDone = true;
+    return;
+  }
+
+  const scannedAt = nowBeijing().format('YYYY-MM-DD HH:mm:ss');
+  atomicWrite(STARTUP_BACKFILL_FILE, {
+    version: 1,
+    stage: 'scanned',
+    scannedAt,
+    commentCount: comments.length,
+    comments,
+    records: [],
+  });
+  console.log(`[主程序] 历史评论已落盘: ${STARTUP_BACKFILL_FILE} (${comments.length} 条)`);
+
+  if (comments.length === 0) {
+    atomicWrite(STARTUP_BACKFILL_FILE, {
+      version: 1,
+      stage: 'done',
+      scannedAt,
+      commentCount: 0,
+      comments: [],
+      records: [],
+      finishedAt: scannedAt,
+    });
+    initialCommentSyncDone = true;
+    console.log('[主程序] 启动兜底完成（无历史评论）');
+    return;
+  }
+
+  const batchOrderIds = new Set();
+  const newRecords = await buildRecordsFromComments(page, comments, batchOrderIds, {
+    onProgress: async (done, total, records) => {
+      if (done % 5 === 0 || done === total) {
+        atomicWrite(STARTUP_BACKFILL_FILE, {
+          version: 1,
+          stage: 'processing',
+          scannedAt,
+          commentCount: comments.length,
+          comments,
+          processedCount: done,
+          records,
+        });
+        console.log(`[主程序] 兜底处理进度: ${done}/${total}`);
+      }
+    },
+  });
+
+  atomicWrite(STARTUP_BACKFILL_FILE, {
+    version: 1,
+    stage: 'processed',
+    scannedAt,
+    commentCount: comments.length,
+    comments,
+    records: newRecords,
+    processedAt: nowBeijing().format('YYYY-MM-DD HH:mm:ss'),
+  });
+  console.log(`[主程序] 兜底记录已落盘: ${newRecords.length} 条待写入`);
+
+  if (newRecords.length > 0) {
+    console.log(`[主程序] 兜底：写入 ${newRecords.length} 条记录到飞书...`);
+    await flushRecords(newRecords);
+  }
+
+  atomicWrite(STARTUP_BACKFILL_FILE, {
+    version: 1,
+    stage: 'done',
+    scannedAt,
+    commentCount: comments.length,
+    writtenCount: newRecords.length,
+    finishedAt: nowBeijing().format('YYYY-MM-DD HH:mm:ss'),
+  });
+
+  initialCommentSyncDone = true;
+  console.log('[主程序] ========== 启动兜底完成，进入常规监控 ==========');
+}
+
+/**
+ * 扫描近期评论，处理新条目
+ *
+ * 1. 仅在"全部"标签扫描，不来回切换标签
+ * 2. 启动兜底已在 runStartupBackfill 中全量扫描；此处只处理时间窗口内新评论
+ * 3. 每条新评论：悬停该行 → 点「查看订单」→ 有则写入订单，无则只写评论
+ * 4. 同一订单号只保留一条带订单的记录
+ */
+async function processNewComments(page) {
+  const result = await getRecentComments(page, config.monitor.commentCheckMinutes, { syncAllVisible: false });
+
+  if (result.error) {
+    console.error('[主程序] 采集评论出错，跳过本轮:', result.error);
+    return false;
+  }
+
+  const allEntries = [...result.comments];
+
+  if (allEntries.length === 0) {
+    console.log('[主程序] 近期无新评论或订单');
+    return true;
+  }
+
+  const orderEntryCount = allEntries.filter(e => e.content && e.content.includes('已下单')).length;
+  if (orderEntryCount > 0) {
+    console.log(`[主程序] 本轮含 ${orderEntryCount} 条带「已下单」标记的评论（仅供参考）`);
+  }
+
+  const batchOrderIds = new Set();
+  const newRecords = await buildRecordsFromComments(page, allEntries, batchOrderIds);
 
   if (newRecords.length > 0) {
     console.log(`[主程序] 准备写入 ${newRecords.length} 条新记录到飞书...`);
@@ -293,6 +405,8 @@ async function monitorLoop(page) {
     console.log(`[主程序] 发现 ${pendingOutbox.length} 条未成功写入的记录，对账后重试...`);
     await flushRecords(pendingOutbox, { isRetry: true });
   }
+
+  await runStartupBackfill(page);
 
   while (true) {
     try {

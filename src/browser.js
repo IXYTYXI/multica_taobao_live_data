@@ -997,6 +997,292 @@ async function scrollCommentList(page, frame) {
   await page.waitForTimeout(400);
 }
 
+/** 在 frame 内扫描当前可见评论（element-scan + innerText） */
+async function scanCommentsInFrame(frame) {
+  return frame.evaluate(() => {
+    const results = [];
+    const seen = new Set();
+    const headerRegex = /(.+?)[\(（]([^)）]+)[\)）][\s\u00a0]*(\d{1,2}:\d{2}(?::\d{2})?)(.*)/;
+    const uiLabels = new Set(['全部', '用户', '主播', '粉丝', '已加购', '已下单', '评论', '活跃用户', '直播互动']);
+
+    const debug = {
+      strategy: [],
+      bodyTextLength: 0,
+      lineCount: 0,
+      innerTextMatches: 0,
+      elementScanMatches: 0,
+      sampleLines: [],
+    };
+
+    function findInteractionRoot() {
+      let best = null;
+      let bestScore = 0;
+      for (const el of document.querySelectorAll('div, section, aside')) {
+        const text = el.textContent || '';
+        if (!text.includes('直播互动') || !text.includes('全部')) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height < 280) continue;
+        if (rect.left > window.innerWidth * 0.55) continue;
+        const score = rect.height * rect.width;
+        if (score > bestScore) {
+          bestScore = score;
+          best = el;
+        }
+      }
+      return best || document.body;
+    }
+
+    function normalizeContent(raw) {
+      return (raw || '').replace(/[\s\u00a0]+/g, ' ').replace(/^[-–—]\s*/, '').trim();
+    }
+
+    function addResult(nickname, userId, timeStr, content) {
+      const hour = parseInt(timeStr.split(':')[0], 10);
+      if (hour > 23) return false;
+      if (nickname.includes('AI助理') || nickname.includes('问答助手')) return false;
+      if (nickname.includes('系统消息') || nickname.includes('管理员')) return false;
+
+      const finalContent = normalizeContent(content);
+      if (!finalContent || finalContent.startsWith('私密回复')) return false;
+      if (uiLabels.has(finalContent)) return false;
+
+      const key = `${nickname.trim()}_${userId}_${timeStr}_${finalContent}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      results.push({
+        nickname: nickname.trim(),
+        userId: userId.trim(),
+        timeStr,
+        content: finalContent,
+      });
+      return true;
+    }
+
+    function extractFromLine(line, nextLines) {
+      const m = line.match(headerRegex);
+      if (!m) return false;
+      const [, nickname, userId, timeStr, inlineContent] = m;
+      let content = normalizeContent(inlineContent);
+      if (!content && nextLines) {
+        for (const nextLine of nextLines) {
+          const trimmed = nextLine.trim();
+          if (!trimmed || headerRegex.test(trimmed) || uiLabels.has(trimmed)) continue;
+          content = trimmed;
+          break;
+        }
+      }
+      return addResult(nickname, userId, timeStr, content);
+    }
+
+    const root = findInteractionRoot();
+    const bodyText = root.innerText || '';
+    debug.bodyTextLength = bodyText.length;
+    const lines = bodyText.split(/\n/);
+    debug.lineCount = lines.length;
+
+    let sampleCount = 0;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.length > 2 && /\d{1,2}:\d{2}/.test(trimmed) && sampleCount < 30) {
+        debug.sampleLines.push(trimmed.substring(0, 120));
+        sampleCount++;
+      }
+    }
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line || line.length < 5) continue;
+      if (!headerRegex.test(line)) continue;
+      debug.innerTextMatches++;
+      extractFromLine(line, lines.slice(i + 1, i + 4));
+    }
+    if (debug.innerTextMatches > 0) debug.strategy.push('innerText');
+
+    for (const el of root.querySelectorAll('div, span, li, p, a, td')) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+      if (rect.height > 120 || rect.height < 5) continue;
+      if (el.children.length > 8) continue;
+
+      const text = el.textContent?.trim();
+      if (!text || text.length < 8 || text.length > 500) continue;
+      if (!/\d{1,2}:\d{2}/.test(text)) continue;
+
+      const m = text.match(headerRegex);
+      if (!m) continue;
+      debug.elementScanMatches++;
+
+      const [, nickname, userId, timeStr, inlineContent] = m;
+      let content = normalizeContent(inlineContent);
+      if (!content) {
+        const nextSib = el.nextElementSibling;
+        if (nextSib) {
+          const sibText = nextSib.textContent?.trim();
+          if (sibText && sibText.length < 300 && !headerRegex.test(sibText)) {
+            content = sibText.split(/[\n\r]+/)[0].trim();
+          }
+        }
+      }
+      addResult(nickname, userId, timeStr, content);
+    }
+    if (debug.elementScanMatches > 0) debug.strategy.push('element-scan');
+
+    debug.strategy = debug.strategy.length ? debug.strategy.join('+') : 'none';
+    return { results, debug };
+  });
+}
+
+function rawScanResultsToComments(rawResults, cutoff = null) {
+  const comments = [];
+  for (const c of rawResults) {
+    const commentTime = parseCommentTime(c.timeStr);
+    if (!commentTime.isValid()) continue;
+    if (cutoff && commentTime.isBefore(cutoff)) continue;
+    comments.push({
+      nickname: c.nickname,
+      userId: c.userId,
+      time: commentTime.format('YYYY-MM-DD HH:mm:ss'),
+      content: c.content,
+    });
+  }
+  return comments;
+}
+
+/** 滚动评论列表一步（用于全量扫描） */
+async function scrollCommentListStep(frame, direction = 'down') {
+  return frame.evaluate((dir) => {
+    function findInteractionRoot() {
+      let best = null;
+      let bestScore = 0;
+      for (const el of document.querySelectorAll('div, section, aside')) {
+        const text = el.textContent || '';
+        if (!text.includes('直播互动') || !text.includes('全部')) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height < 280 || rect.left > window.innerWidth * 0.55) continue;
+        const score = rect.height * rect.width;
+        if (score > bestScore) {
+          bestScore = score;
+          best = el;
+        }
+      }
+      return best || document.body;
+    }
+
+    const root = findInteractionRoot();
+    const scrollables = [];
+    for (const el of root.querySelectorAll('*')) {
+      const style = window.getComputedStyle(el);
+      if (
+        (style.overflowY === 'auto' || style.overflowY === 'scroll') &&
+        el.scrollHeight > el.clientHeight + 30
+      ) {
+        scrollables.push(el);
+      }
+    }
+    scrollables.sort((a, b) => b.scrollHeight - a.scrollHeight);
+    const scroller = scrollables[0];
+    if (!scroller) return { found: false };
+
+    const step = Math.max(scroller.clientHeight * 0.75, 120);
+    const prevTop = scroller.scrollTop;
+    if (dir === 'up') {
+      scroller.scrollTop = Math.max(0, scroller.scrollTop - step);
+    } else {
+      scroller.scrollTop = Math.min(scroller.scrollHeight, scroller.scrollTop + step);
+    }
+
+    return {
+      found: true,
+      moved: scroller.scrollTop !== prevTop,
+      atTop: scroller.scrollTop <= 5,
+      atEnd: scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 5,
+      scrollTop: scroller.scrollTop,
+      scrollHeight: scroller.scrollHeight,
+    };
+  }, direction);
+}
+
+/**
+ * 启动兜底：滚动加载并合并整场直播目前已加载的全部评论
+ * 适用于程序启动时直播已在进行的情况
+ */
+async function scrollAndCollectAllComments(page) {
+  const frame = await getContentFrame(page);
+  await ensureCommentTab(page, '全部');
+
+  console.log('[浏览器] 启动兜底：滚动全量扫描历史评论...');
+
+  const merged = new Map();
+
+  const mergeScan = (rawResults) => {
+    const batch = rawScanResultsToComments(rawResults, null);
+    let added = 0;
+    for (const c of batch) {
+      const key = `${c.userId}_${c.time}_${c.content}`;
+      if (!merged.has(key)) {
+        merged.set(key, c);
+        added++;
+      }
+    }
+    return added;
+  };
+
+  // 先滚到顶部
+  for (let i = 0; i < 30; i++) {
+    const s = await scrollCommentListStep(frame, 'up');
+    if (!s.found || s.atTop) break;
+    await page.waitForTimeout(200);
+  }
+
+  let firstScan = await scanCommentsInFrame(frame);
+  mergeScan(firstScan.results);
+  console.log(`[浏览器] 兜底初始扫描: ${merged.size} 条`);
+
+  let stagnant = 0;
+  for (let step = 0; step < 150; step++) {
+    const scroll = await scrollCommentListStep(frame, 'down');
+    if (!scroll.found) break;
+    await page.waitForTimeout(350);
+
+    const scan = await scanCommentsInFrame(frame);
+    const added = mergeScan(scan.results);
+    if (added === 0) stagnant += 1;
+    else stagnant = 0;
+
+    if (step % 10 === 0) {
+      console.log(`[浏览器] 兜底滚动 step=${step}, 累计 ${merged.size} 条`);
+    }
+    if (scroll.atEnd && stagnant >= 3) break;
+    if (stagnant >= 6) break;
+    if (!scroll.moved && scroll.atEnd) break;
+  }
+
+  // 滚回底部，便于后续监控新评论
+  await frame.evaluate(() => {
+    function findScroller() {
+      for (const el of document.querySelectorAll('div, section, aside, *')) {
+        const text = el.textContent || '';
+        if (!text.includes('直播互动')) continue;
+        const style = window.getComputedStyle(el);
+        if (
+          (style.overflowY === 'auto' || style.overflowY === 'scroll') &&
+          el.scrollHeight > el.clientHeight + 30
+        ) {
+          return el;
+        }
+      }
+      return null;
+    }
+    const scroller = findScroller();
+    if (scroller) scroller.scrollTop = scroller.scrollHeight;
+  });
+  await page.waitForTimeout(400);
+
+  const comments = [...merged.values()].sort((a, b) => a.time.localeCompare(b.time));
+  console.log(`[浏览器] 兜底全量扫描完成，共 ${comments.length} 条去重评论`);
+  return { comments, debug: firstScan.debug };
+}
+
 async function getRecentComments(page, withinMinutes, { syncAllVisible = false } = {}) {
   const cutoff = syncAllVisible || withinMinutes == null
     ? null
@@ -1017,187 +1303,12 @@ async function getRecentComments(page, withinMinutes, { syncAllVisible = false }
   const comments = [];
 
   try {
-    let rawComments = await frame.evaluate(() => {
-      const results = [];
-      const seen = new Set();
-      const headerRegex = /(.+?)[\(（]([^)）]+)[\)）][\s\u00a0]*(\d{1,2}:\d{2}(?::\d{2})?)(.*)/;
-      const uiLabels = new Set(['全部', '用户', '主播', '粉丝', '已加购', '已下单', '评论', '活跃用户', '直播互动']);
-
-      const debug = {
-        strategy: [],
-        bodyTextLength: 0,
-        lineCount: 0,
-        innerTextMatches: 0,
-        elementScanMatches: 0,
-        sampleLines: [],
-      };
-
-      function findInteractionRoot() {
-        let best = null;
-        let bestScore = 0;
-        for (const el of document.querySelectorAll('div, section, aside')) {
-          const text = el.textContent || '';
-          if (!text.includes('直播互动') || !text.includes('全部')) continue;
-          const rect = el.getBoundingClientRect();
-          if (rect.width === 0 || rect.height < 280) continue;
-          if (rect.left > window.innerWidth * 0.55) continue;
-          const score = rect.height * rect.width;
-          if (score > bestScore) {
-            bestScore = score;
-            best = el;
-          }
-        }
-        return best || document.body;
-      }
-
-      function normalizeContent(raw) {
-        return (raw || '').replace(/[\s\u00a0]+/g, ' ').replace(/^[-–—]\s*/, '').trim();
-      }
-
-      function addResult(nickname, userId, timeStr, content) {
-        const hour = parseInt(timeStr.split(':')[0], 10);
-        if (hour > 23) return false;
-        if (nickname.includes('AI助理') || nickname.includes('问答助手')) return false;
-        if (nickname.includes('系统消息') || nickname.includes('管理员')) return false;
-
-        let finalContent = normalizeContent(content);
-        if (!finalContent || finalContent.startsWith('私密回复')) return false;
-        if (uiLabels.has(finalContent)) return false;
-
-        const key = `${nickname.trim()}_${userId}_${timeStr}_${finalContent}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        results.push({
-          nickname: nickname.trim(),
-          userId: userId.trim(),
-          timeStr,
-          content: finalContent,
-        });
-        return true;
-      }
-
-      function extractFromLine(line, nextLines) {
-        const m = line.match(headerRegex);
-        if (!m) return false;
-        const [, nickname, userId, timeStr, inlineContent] = m;
-        let content = normalizeContent(inlineContent);
-        if (!content && nextLines) {
-          for (const nextLine of nextLines) {
-            const trimmed = nextLine.trim();
-            if (!trimmed || headerRegex.test(trimmed) || uiLabels.has(trimmed)) continue;
-            content = trimmed;
-            break;
-          }
-        }
-        return addResult(nickname, userId, timeStr, content);
-      }
-
-      const root = findInteractionRoot();
-      const bodyText = root.innerText || '';
-      debug.bodyTextLength = bodyText.length;
-      const lines = bodyText.split(/\n/);
-      debug.lineCount = lines.length;
-
-      let sampleCount = 0;
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.length > 2 && /\d{1,2}:\d{2}/.test(trimmed) && sampleCount < 30) {
-          debug.sampleLines.push(trimmed.substring(0, 120));
-          sampleCount++;
-        }
-      }
-
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (!line || line.length < 5) continue;
-        if (!headerRegex.test(line)) continue;
-        debug.innerTextMatches++;
-        extractFromLine(line, lines.slice(i + 1, i + 4));
-      }
-      if (debug.innerTextMatches > 0) debug.strategy.push('innerText');
-
-      for (const el of root.querySelectorAll('div, span, li, p, a, td')) {
-        const rect = el.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) continue;
-        if (rect.height > 120 || rect.height < 5) continue;
-        if (el.children.length > 8) continue;
-
-        const text = el.textContent?.trim();
-        if (!text || text.length < 8 || text.length > 500) continue;
-        if (!/\d{1,2}:\d{2}/.test(text)) continue;
-
-        const m = text.match(headerRegex);
-        if (!m) continue;
-        debug.elementScanMatches++;
-
-        const [, nickname, userId, timeStr, inlineContent] = m;
-        let content = normalizeContent(inlineContent);
-        if (!content) {
-          const nextSib = el.nextElementSibling;
-          if (nextSib) {
-            const sibText = nextSib.textContent?.trim();
-            if (sibText && sibText.length < 300 && !headerRegex.test(sibText)) {
-              content = sibText.split(/[\n\r]+/)[0].trim();
-            }
-          }
-        }
-        addResult(nickname, userId, timeStr, content);
-      }
-      if (debug.elementScanMatches > 0) debug.strategy.push('element-scan');
-
-      debug.strategy = debug.strategy.length ? debug.strategy.join('+') : 'none';
-      return { results, debug };
-    });
+    let rawComments = await scanCommentsInFrame(frame);
 
     if (syncAllVisible && rawComments.results.length === 0) {
       console.log('[浏览器] 首次扫描无评论，等待渲染后重试...');
       await page.waitForTimeout(2000);
-      rawComments = await frame.evaluate(() => {
-        const results = [];
-        const seen = new Set();
-        const headerRegex = /(.+?)[\(（]([^)）]+)[\)）][\s\u00a0]*(\d{1,2}:\d{2}(?::\d{2})?)(.*)/;
-        const uiLabels = new Set(['全部', '用户', '主播', '粉丝', '已加购', '已下单', '评论', '活跃用户', '直播互动']);
-        function findInteractionRoot() {
-          let best = null, bestScore = 0;
-          for (const el of document.querySelectorAll('div, section, aside')) {
-            const text = el.textContent || '';
-            if (!text.includes('直播互动') || !text.includes('全部')) continue;
-            const rect = el.getBoundingClientRect();
-            if (rect.width === 0 || rect.height < 280 || rect.left > window.innerWidth * 0.55) continue;
-            const score = rect.height * rect.width;
-            if (score > bestScore) { bestScore = score; best = el; }
-          }
-          return best || document.body;
-        }
-        function normalizeContent(raw) {
-          return (raw || '').replace(/[\s\u00a0]+/g, ' ').replace(/^[-–—]\s*/, '').trim();
-        }
-        function addResult(nickname, userId, timeStr, content) {
-          const finalContent = normalizeContent(content);
-          if (!finalContent || finalContent.startsWith('私密回复') || uiLabels.has(finalContent)) return;
-          if (nickname.includes('AI助理') || nickname.includes('问答助手')) return;
-          const key = `${nickname.trim()}_${userId}_${timeStr}_${finalContent}`;
-          if (seen.has(key)) return;
-          seen.add(key);
-          results.push({ nickname: nickname.trim(), userId: userId.trim(), timeStr, content: finalContent });
-        }
-        const root = findInteractionRoot();
-        for (const el of root.querySelectorAll('div, span, li, p, a, td')) {
-          const rect = el.getBoundingClientRect();
-          if (rect.width === 0 || rect.height === 0 || rect.height > 120 || el.children.length > 8) continue;
-          const text = el.textContent?.trim();
-          if (!text || text.length < 8 || text.length > 500 || !/\d{1,2}:\d{2}/.test(text)) continue;
-          const m = text.match(headerRegex);
-          if (!m) continue;
-          let content = normalizeContent(m[4]);
-          if (!content) {
-            const sib = el.nextElementSibling?.textContent?.trim();
-            if (sib && sib.length < 300) content = sib.split(/[\n\r]+/)[0].trim();
-          }
-          addResult(m[1], m[2], m[3], content);
-        }
-        return { results, debug: { strategy: 'retry-element-scan', bodyTextLength: (root.innerText || '').length, lineCount: 0, innerTextMatches: 0, elementScanMatches: results.length, sampleLines: [] } };
-      });
+      rawComments = await scanCommentsInFrame(frame);
     }
 
     // 诊断日志
@@ -1612,6 +1723,7 @@ module.exports = {
   debugScanPage,
   getTransactionCount,
   getRecentComments,
+  scrollAndCollectAllComments,
   getOrdersFromTab,
   extractAllOrders,
   viewOrderForComment,

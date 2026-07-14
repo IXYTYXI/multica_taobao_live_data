@@ -47,6 +47,8 @@ const config = {
     commentCheckMinutes: parseInt(process.env.COMMENT_CHECK_MINUTES || '5', 10),
     // 首次同步是否滚动评论列表（默认 false，避免干扰直播界面）
     scrollOnSync: process.env.SCROLL_ON_SYNC === 'true',
+    // 启动兜底：直播已在进行时，先滚动全量扫描历史评论并落盘（默认开启）
+    startupBackfill: process.env.STARTUP_BACKFILL !== 'false',
   },
 };
 
