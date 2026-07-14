@@ -272,7 +272,7 @@ function main() {
   // 将 pm2 名称写入环境，供 shell 脚本读取（可选增强）
   process.env.SCHEDULE_PM2_NAME = schedule.pm2Name;
 
-  console.log('[schedule] 请先确保已执行: npm install -g pm2 && pm2 start npm --name taobao-live -- start');
+  console.log('[schedule] 请先确保已执行: npm install -g pm2 && pm2 start src/index.js --name taobao-live');
   console.log('[schedule] 正在写入系统计划任务...\n');
 
   if (platform === 'macos') installMacOS(scripts);

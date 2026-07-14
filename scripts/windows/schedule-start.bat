@@ -17,7 +17,7 @@ for /f "delims=" %%i in ('node -e "require('dotenv').config({path:require('path'
 
 pm2 describe %PM2_NAME% >nul 2>&1
 if errorlevel 1 (
-  pm2 start npm --name %PM2_NAME% -- start
+  pm2 start "%PROJECT_DIR%\src\index.js" --name %PM2_NAME%
 ) else (
   pm2 restart %PM2_NAME%
 )

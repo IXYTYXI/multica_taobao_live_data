@@ -24,7 +24,7 @@ fi
 if "$PM2" describe "$PM2_NAME" &>/dev/null; then
   "$PM2" restart "$PM2_NAME"
 else
-  "$PM2" start npm --name "$PM2_NAME" -- start
+  "$PM2" start "$PROJECT_DIR/src/index.js" --name "$PM2_NAME"
 fi
 
 "$PM2" save
