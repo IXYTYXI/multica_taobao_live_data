@@ -45,6 +45,8 @@ const config = {
   monitor: {
     intervalSeconds: parseInt(process.env.MONITOR_INTERVAL || '10', 10),
     commentCheckMinutes: parseInt(process.env.COMMENT_CHECK_MINUTES || '5', 10),
+    // 首次同步是否滚动评论列表（默认 false，避免干扰直播界面）
+    scrollOnSync: process.env.SCROLL_ON_SYNC === 'true',
   },
 };
 

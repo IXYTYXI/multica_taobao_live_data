@@ -545,8 +545,10 @@ async function findActivePage(page) {
 
       console.log(`[浏览器] 标签页${i}: url=${info.url.substring(0, 80)}, 文本=${info.textLength}字, 直播互动=${info.hasLiveInteraction}`);
 
-      // 评分：文本量大 + 包含"直播互动" = 最可能是中控台
+      // 评分：URL 优先，其次文本量与评论格式
       let score = 0;
+      if (info.url.includes('/live/control')) score += 1000;
+      if (info.url.includes('/live/list')) score -= 500;
       if (info.hasLiveInteraction) score += 100;
       if (info.textLength > 3000) score += 50;
       if (info.textLength > 1000) score += 20;
@@ -798,6 +800,69 @@ async function getContentFrame(page) {
   return page;
 }
 
+/** 评论行正则：支持 `昵称(id) 10:23内容`（时间与内容间可无空格） */
+const COMMENT_HEADER_REGEX = /(.+?)[\(（]([^)）]+)[\)）][\s\u00a0]*(\d{1,2}:\d{2}(?::\d{2})?)(.*)/;
+
+/**
+ * 读取"直播互动"区域当前激活的子标签
+ */
+async function getActiveCommentTab(page) {
+  const frame = await getContentFrame(page);
+  try {
+    return await frame.evaluate(() => {
+      let interactionContainer = null;
+      for (const el of document.querySelectorAll('*')) {
+        const ownText = el.textContent?.trim();
+        if (ownText === '直播互动' || (ownText?.startsWith('直播互动') && ownText.length < 20)) {
+          let parent = el;
+          for (let i = 0; i < 8 && parent; i++) {
+            if (parent.getBoundingClientRect().height > 200) {
+              interactionContainer = parent;
+              break;
+            }
+            parent = parent.parentElement;
+          }
+          if (interactionContainer) break;
+        }
+      }
+      const searchRoot = interactionContainer || document.body;
+      const tabNames = ['全部', '已下单', '已加购', '用户', '主播', '粉丝'];
+      for (const el of searchRoot.querySelectorAll('div, span, a, button, li, label')) {
+        const ownText = el.textContent?.trim();
+        if (!tabNames.includes(ownText)) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        const style = window.getComputedStyle(el);
+        const cls = typeof el.className === 'string' ? el.className : '';
+        const active =
+          el.getAttribute('aria-selected') === 'true' ||
+          el.getAttribute('aria-current') === 'true' ||
+          cls.includes('active') ||
+          cls.includes('selected') ||
+          cls.includes('current') ||
+          style.fontWeight === '700' ||
+          style.fontWeight === 'bold';
+        if (active) return ownText;
+      }
+      return null;
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 仅在需要时切换标签，避免每轮来回点击
+ */
+async function ensureCommentTab(page, tabText) {
+  const active = await getActiveCommentTab(page);
+  if (active === tabText) {
+    console.log(`[浏览器] 已在"${tabText}"标签，跳过切换`);
+    return;
+  }
+  await clickCommentTab(page, tabText);
+}
+
 /**
  * 在"直播互动"区域内点击指定标签
  * 先定位"直播互动"容器，再在其中查找标签，避免误点右侧"口袋商品"区域
@@ -870,221 +935,274 @@ function parseCommentTime(timeStr) {
 }
 
 /**
- * 获取近期评论
+ * 获取近期评论（仅在"全部"标签扫描，含"已下单"类条目，不切换标签）
  *
- * 三层策略：
- *   0. innerText 全文扫描（主策略 — 最可靠，不依赖 DOM 结构，穿透 Shadow DOM）
- *   1. 元素级 textContent 扫描（补充 — 处理 innerText 行分割异常的情况）
- *   2. TreeWalker 文本节点扫描（兜底）
+ * @param {import('playwright').Page} page
+ * @param {number|null} withinMinutes - 时间窗口（分钟）；null 表示不过滤，取当前可见全部
  */
-async function getRecentComments(page, withinMinutes) {
-  const cutoff = nowBeijing().subtract(withinMinutes, 'minute');
-  console.log(`[浏览器] 获取 ${cutoff.format('HH:mm:ss')} 之后的评论...`);
+/**
+ * 首次同步时滚动评论列表，尽量加载虚拟列表中的历史评论
+ */
+async function scrollCommentList(page, frame) {
+  const scrolled = await frame.evaluate(async () => {
+    function findInteractionRoot() {
+      let best = null;
+      let bestScore = 0;
+      for (const el of document.querySelectorAll('div, section, aside')) {
+        const text = el.textContent || '';
+        if (!text.includes('直播互动') || !text.includes('全部')) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height < 280) continue;
+        if (rect.left > window.innerWidth * 0.55) continue;
+        const score = rect.height * rect.width;
+        if (score > bestScore) {
+          bestScore = score;
+          best = el;
+        }
+      }
+      return best || document.body;
+    }
+
+    const root = findInteractionRoot();
+    const scrollables = [];
+    for (const el of root.querySelectorAll('*')) {
+      const style = window.getComputedStyle(el);
+      if (
+        (style.overflowY === 'auto' || style.overflowY === 'scroll') &&
+        el.scrollHeight > el.clientHeight + 30
+      ) {
+        scrollables.push(el);
+      }
+    }
+    scrollables.sort((a, b) => b.scrollHeight - a.scrollHeight);
+    const scroller = scrollables[0];
+    if (!scroller) return { scrolled: false, rootTextLength: (root.innerText || '').length };
+
+    const step = Math.max(scroller.clientHeight * 0.8, 120);
+    scroller.scrollTop = scroller.scrollHeight;
+    await new Promise((r) => setTimeout(r, 200));
+    for (let pos = scroller.scrollHeight; pos >= 0; pos -= step) {
+      scroller.scrollTop = pos;
+      await new Promise((r) => setTimeout(r, 120));
+    }
+    scroller.scrollTop = 0;
+    await new Promise((r) => setTimeout(r, 200));
+    return { scrolled: true, rootTextLength: (root.innerText || '').length, scrollHeight: scroller.scrollHeight };
+  });
+  if (scrolled.scrolled) {
+    console.log(`[浏览器] 已滚动评论列表 (scrollHeight=${scrolled.scrollHeight}, 区域文本=${scrolled.rootTextLength}字)`);
+  } else {
+    console.log(`[浏览器] 未找到可滚动评论列表 (区域文本=${scrolled.rootTextLength}字)`);
+  }
+  await page.waitForTimeout(400);
+}
+
+async function getRecentComments(page, withinMinutes, { syncAllVisible = false } = {}) {
+  const cutoff = syncAllVisible || withinMinutes == null
+    ? null
+    : nowBeijing().subtract(withinMinutes, 'minute');
+  if (cutoff) {
+    console.log(`[浏览器] 获取 ${cutoff.format('HH:mm:ss')} 之后的评论...`);
+  } else {
+    console.log('[浏览器] 获取当前可见的全部评论（首次同步）...');
+  }
 
   const frame = await getContentFrame(page);
-  await clickCommentTab(page, '全部');
+  await ensureCommentTab(page, '全部');
+  if (syncAllVisible && config.monitor.scrollOnSync) {
+    await scrollCommentList(page, frame);
+    await page.waitForTimeout(2000);
+  }
 
   const comments = [];
 
   try {
-    const rawComments = await frame.evaluate(() => {
+    let rawComments = await frame.evaluate(() => {
       const results = [];
       const seen = new Set();
-      const headerRegex = /(.+?)[\(（]([^)）]+)[\)）]\s*(\d{1,2}:\d{2}(?::\d{2})?)/;
+      const headerRegex = /(.+?)[\(（]([^)）]+)[\)）][\s\u00a0]*(\d{1,2}:\d{2}(?::\d{2})?)(.*)/;
+      const uiLabels = new Set(['全部', '用户', '主播', '粉丝', '已加购', '已下单', '评论', '活跃用户', '直播互动']);
 
       const debug = {
-        strategy: 'none',
+        strategy: [],
         bodyTextLength: 0,
         lineCount: 0,
         innerTextMatches: 0,
         elementScanMatches: 0,
-        treewalkerMatches: 0,
         sampleLines: [],
       };
+
+      function findInteractionRoot() {
+        let best = null;
+        let bestScore = 0;
+        for (const el of document.querySelectorAll('div, section, aside')) {
+          const text = el.textContent || '';
+          if (!text.includes('直播互动') || !text.includes('全部')) continue;
+          const rect = el.getBoundingClientRect();
+          if (rect.width === 0 || rect.height < 280) continue;
+          if (rect.left > window.innerWidth * 0.55) continue;
+          const score = rect.height * rect.width;
+          if (score > bestScore) {
+            bestScore = score;
+            best = el;
+          }
+        }
+        return best || document.body;
+      }
+
+      function normalizeContent(raw) {
+        return (raw || '').replace(/[\s\u00a0]+/g, ' ').replace(/^[-–—]\s*/, '').trim();
+      }
 
       function addResult(nickname, userId, timeStr, content) {
         const hour = parseInt(timeStr.split(':')[0], 10);
         if (hour > 23) return false;
         if (nickname.includes('AI助理') || nickname.includes('问答助手')) return false;
         if (nickname.includes('系统消息') || nickname.includes('管理员')) return false;
-        if (!content || content.startsWith('私密回复')) return false;
 
-        const key = `${nickname.trim()}_${userId}_${timeStr}_${content}`;
+        let finalContent = normalizeContent(content);
+        if (!finalContent || finalContent.startsWith('私密回复')) return false;
+        if (uiLabels.has(finalContent)) return false;
+
+        const key = `${nickname.trim()}_${userId}_${timeStr}_${finalContent}`;
         if (seen.has(key)) return false;
         seen.add(key);
-        results.push({ nickname: nickname.trim(), userId: userId.trim(), timeStr, content });
+        results.push({
+          nickname: nickname.trim(),
+          userId: userId.trim(),
+          timeStr,
+          content: finalContent,
+        });
         return true;
       }
 
-      // ── 策略0: innerText 全文扫描 ──
-      // innerText 返回页面上所有可见文本，包括 Shadow DOM 内容
-      // 按行分割后逐行正则匹配，完全不依赖 DOM 元素结构
-      try {
-        const bodyText = document.body.innerText || '';
-        debug.bodyTextLength = bodyText.length;
-        const lines = bodyText.split(/\n/);
-        debug.lineCount = lines.length;
-
-        // 采样：包含时间模式的行（用于诊断）
-        let sampleCount = 0;
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed.length > 2 && /\d{1,2}:\d{2}/.test(trimmed) && sampleCount < 30) {
-            debug.sampleLines.push(trimmed.substring(0, 120));
-            sampleCount++;
+      function extractFromLine(line, nextLines) {
+        const m = line.match(headerRegex);
+        if (!m) return false;
+        const [, nickname, userId, timeStr, inlineContent] = m;
+        let content = normalizeContent(inlineContent);
+        if (!content && nextLines) {
+          for (const nextLine of nextLines) {
+            const trimmed = nextLine.trim();
+            if (!trimmed || headerRegex.test(trimmed) || uiLabels.has(trimmed)) continue;
+            content = trimmed;
+            break;
           }
         }
-
-        for (let i = 0; i < lines.length; i++) {
-          const line = lines[i].trim();
-          if (!line || line.length < 5) continue;
-
-          const m = line.match(headerRegex);
-          if (!m) continue;
-          debug.innerTextMatches++;
-
-          const [fullMatch, nickname, userId, timeStr] = m;
-
-          // 内容可能在同一行（头部之后），或在下一行
-          let content = '';
-
-          // 先检查同行：头部匹配后的剩余文本
-          const afterHeader = line.substring(line.indexOf(fullMatch) + fullMatch.length).trim();
-          if (afterHeader && !headerRegex.test(afterHeader)) {
-            content = afterHeader;
-          }
-
-          // 再检查后续行
-          if (!content) {
-            for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
-              const nextLine = lines[j].trim();
-              if (!nextLine) continue;
-              if (headerRegex.test(nextLine)) break;
-              // 跳过明显是 UI 元素的文本
-              if (nextLine === '全部' || nextLine === '用户' || nextLine === '主播' ||
-                  nextLine === '粉丝' || nextLine === '已加购' || nextLine === '已下单' ||
-                  nextLine === '评论' || nextLine === '活跃用户' || nextLine === '直播互动') continue;
-              content = nextLine;
-              break;
-            }
-          }
-
-          addResult(nickname, userId, timeStr, content);
-        }
-
-        if (results.length > 0) {
-          debug.strategy = 'innerText';
-        }
-      } catch (e) {
-        debug.innerTextError = e.message;
+        return addResult(nickname, userId, timeStr, content);
       }
 
-      // ── 策略1: 元素 textContent 扫描（回退） ──
-      if (results.length === 0) {
-        for (const el of document.querySelectorAll('div, span, li, p, a, td')) {
-          const rect = el.getBoundingClientRect();
-          if (rect.width === 0 || rect.height === 0) continue;
-          if (rect.height > 300 || rect.height < 5) continue;
+      const root = findInteractionRoot();
+      const bodyText = root.innerText || '';
+      debug.bodyTextLength = bodyText.length;
+      const lines = bodyText.split(/\n/);
+      debug.lineCount = lines.length;
 
-          const text = el.textContent?.trim();
-          if (!text || text.length < 5 || text.length > 800) continue;
-          if (!/\d{1,2}:\d{2}/.test(text)) continue;
-          if (el.querySelectorAll('div, span, li, p').length > 20) continue;
-
-          const m = text.match(headerRegex);
-          if (!m) continue;
-          debug.elementScanMatches++;
-
-          const [fullMatch, nickname, userId, timeStr] = m;
-
-          let content = '';
-          const afterIdx = text.indexOf(fullMatch);
-          if (afterIdx >= 0) {
-            const afterText = text.substring(afterIdx + fullMatch.length).trim();
-            if (afterText) {
-              for (const line of afterText.split(/[\n\r]+/)) {
-                const trimmed = line.trim();
-                if (trimmed && !headerRegex.test(trimmed)) { content = trimmed; break; }
-              }
-            }
-          }
-          if (!content) {
-            const nextSib = el.nextElementSibling;
-            if (nextSib) {
-              const sibText = nextSib.textContent?.trim();
-              if (sibText && sibText.length < 300 && !headerRegex.test(sibText)) {
-                content = sibText.split(/[\n\r]+/)[0].trim();
-              }
-            }
-          }
-          if (!content && el.parentElement) {
-            let foundEl = false;
-            for (const child of el.parentElement.children) {
-              if (child === el || child.contains(el)) { foundEl = true; continue; }
-              if (foundEl) {
-                const childText = child.textContent?.trim();
-                if (childText && childText.length < 300 && !headerRegex.test(childText)) {
-                  content = childText.split(/[\n\r]+/)[0].trim();
-                  break;
-                }
-              }
-            }
-          }
-
-          addResult(nickname, userId, timeStr, content);
+      let sampleCount = 0;
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.length > 2 && /\d{1,2}:\d{2}/.test(trimmed) && sampleCount < 30) {
+          debug.sampleLines.push(trimmed.substring(0, 120));
+          sampleCount++;
         }
-        if (results.length > 0) debug.strategy = 'element-scan';
       }
 
-      // ── 策略2: TreeWalker（兜底） ──
-      if (results.length === 0) {
-        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
-        while (walker.nextNode()) {
-          const nodeText = walker.currentNode.textContent.trim();
-          if (!nodeText || nodeText.length < 5 || nodeText.length > 300) continue;
-          const match = nodeText.match(headerRegex);
-          if (!match) continue;
-          debug.treewalkerMatches++;
-
-          const [fullMatch, nickname, userId, timeStr] = match;
-          const headerEl = walker.currentNode.parentElement;
-          if (!headerEl) continue;
-
-          let content = '';
-          const afterTime = nodeText.substring(nodeText.indexOf(timeStr) + timeStr.length).trim();
-          if (afterTime && !headerRegex.test(afterTime)) content = afterTime.split(/[\n\r]+/)[0].trim();
-
-          if (!content) {
-            const nextSib = headerEl.nextElementSibling;
-            if (nextSib) {
-              const sibText = nextSib.textContent?.trim();
-              if (sibText && sibText.length < 300 && !headerRegex.test(sibText)) {
-                content = sibText.split(/[\n\r]+/)[0].trim();
-              }
-            }
-          }
-          if (!content && headerEl.parentElement) {
-            let found = false;
-            for (const child of headerEl.parentElement.children) {
-              if (child === headerEl) { found = true; continue; }
-              if (found) {
-                const ct = child.textContent?.trim();
-                if (ct && ct.length < 300 && !headerRegex.test(ct)) { content = ct.split(/[\n\r]+/)[0].trim(); break; }
-              }
-            }
-          }
-
-          addResult(nickname, userId, timeStr, content);
-        }
-        if (results.length > 0) debug.strategy = 'treewalker';
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line || line.length < 5) continue;
+        if (!headerRegex.test(line)) continue;
+        debug.innerTextMatches++;
+        extractFromLine(line, lines.slice(i + 1, i + 4));
       }
+      if (debug.innerTextMatches > 0) debug.strategy.push('innerText');
 
+      for (const el of root.querySelectorAll('div, span, li, p, a, td')) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.height > 120 || rect.height < 5) continue;
+        if (el.children.length > 8) continue;
+
+        const text = el.textContent?.trim();
+        if (!text || text.length < 8 || text.length > 500) continue;
+        if (!/\d{1,2}:\d{2}/.test(text)) continue;
+
+        const m = text.match(headerRegex);
+        if (!m) continue;
+        debug.elementScanMatches++;
+
+        const [, nickname, userId, timeStr, inlineContent] = m;
+        let content = normalizeContent(inlineContent);
+        if (!content) {
+          const nextSib = el.nextElementSibling;
+          if (nextSib) {
+            const sibText = nextSib.textContent?.trim();
+            if (sibText && sibText.length < 300 && !headerRegex.test(sibText)) {
+              content = sibText.split(/[\n\r]+/)[0].trim();
+            }
+          }
+        }
+        addResult(nickname, userId, timeStr, content);
+      }
+      if (debug.elementScanMatches > 0) debug.strategy.push('element-scan');
+
+      debug.strategy = debug.strategy.length ? debug.strategy.join('+') : 'none';
       return { results, debug };
     });
 
+    if (syncAllVisible && rawComments.results.length === 0) {
+      console.log('[浏览器] 首次扫描无评论，等待渲染后重试...');
+      await page.waitForTimeout(2000);
+      rawComments = await frame.evaluate(() => {
+        const results = [];
+        const seen = new Set();
+        const headerRegex = /(.+?)[\(（]([^)）]+)[\)）][\s\u00a0]*(\d{1,2}:\d{2}(?::\d{2})?)(.*)/;
+        const uiLabels = new Set(['全部', '用户', '主播', '粉丝', '已加购', '已下单', '评论', '活跃用户', '直播互动']);
+        function findInteractionRoot() {
+          let best = null, bestScore = 0;
+          for (const el of document.querySelectorAll('div, section, aside')) {
+            const text = el.textContent || '';
+            if (!text.includes('直播互动') || !text.includes('全部')) continue;
+            const rect = el.getBoundingClientRect();
+            if (rect.width === 0 || rect.height < 280 || rect.left > window.innerWidth * 0.55) continue;
+            const score = rect.height * rect.width;
+            if (score > bestScore) { bestScore = score; best = el; }
+          }
+          return best || document.body;
+        }
+        function normalizeContent(raw) {
+          return (raw || '').replace(/[\s\u00a0]+/g, ' ').replace(/^[-–—]\s*/, '').trim();
+        }
+        function addResult(nickname, userId, timeStr, content) {
+          const finalContent = normalizeContent(content);
+          if (!finalContent || finalContent.startsWith('私密回复') || uiLabels.has(finalContent)) return;
+          if (nickname.includes('AI助理') || nickname.includes('问答助手')) return;
+          const key = `${nickname.trim()}_${userId}_${timeStr}_${finalContent}`;
+          if (seen.has(key)) return;
+          seen.add(key);
+          results.push({ nickname: nickname.trim(), userId: userId.trim(), timeStr, content: finalContent });
+        }
+        const root = findInteractionRoot();
+        for (const el of root.querySelectorAll('div, span, li, p, a, td')) {
+          const rect = el.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0 || rect.height > 120 || el.children.length > 8) continue;
+          const text = el.textContent?.trim();
+          if (!text || text.length < 8 || text.length > 500 || !/\d{1,2}:\d{2}/.test(text)) continue;
+          const m = text.match(headerRegex);
+          if (!m) continue;
+          let content = normalizeContent(m[4]);
+          if (!content) {
+            const sib = el.nextElementSibling?.textContent?.trim();
+            if (sib && sib.length < 300) content = sib.split(/[\n\r]+/)[0].trim();
+          }
+          addResult(m[1], m[2], m[3], content);
+        }
+        return { results, debug: { strategy: 'retry-element-scan', bodyTextLength: (root.innerText || '').length, lineCount: 0, innerTextMatches: 0, elementScanMatches: results.length, sampleLines: [] } };
+      });
+    }
+
     // 诊断日志
     const d = rawComments.debug;
-    console.log(`[浏览器] 评论扫描: strategy=${d.strategy}, bodyText=${d.bodyTextLength}字, ${d.lineCount}行, innerText匹配=${d.innerTextMatches}, element匹配=${d.elementScanMatches}, treewalker匹配=${d.treewalkerMatches}`);
+    console.log(`[浏览器] 评论扫描: strategy=${d.strategy}, bodyText=${d.bodyTextLength}字, ${d.lineCount}行, innerText匹配=${d.innerTextMatches}, element匹配=${d.elementScanMatches}`);
     console.log(`[浏览器] 原始评论数: ${rawComments.results.length}`);
 
     if (rawComments.results.length === 0 && d.sampleLines.length > 0) {
@@ -1107,7 +1225,8 @@ async function getRecentComments(page, withinMinutes) {
 
     for (const c of rawComments.results) {
       const commentTime = parseCommentTime(c.timeStr);
-      if (!commentTime.isValid() || !commentTime.isAfter(cutoff)) continue;
+      if (!commentTime.isValid()) continue;
+      if (cutoff && commentTime.isBefore(cutoff)) continue;
 
       comments.push({
         nickname: c.nickname,
@@ -1353,213 +1472,136 @@ async function extractOrdersFromPopup(page) {
 }
 
 /**
- * 从"直播互动"区域找到订单入口并提取订单数据
- *
- * 淘宝中控台的"订单"入口是"直播互动"区域顶部工具栏中的一个小图标按钮，
- * 没有文字标签。点击后弹出一个 modal 对话框显示订单列表。
- *
- * 策略：
- *   1. 直接搜索已打开的订单对话框（可能已经打开）
- *   2. 搜索含"订单"文字的按钮/链接
- *   3. 搜索"直播互动"标题附近的小图标按钮，逐个尝试点击
- *   4. 悬停"已下单"条目查找右侧入口
+ * 只读：若订单弹窗已打开则读取
  */
 async function extractAllOrders(page) {
-  const frame = await getContentFrame(page);
   try {
-    await clickCommentTab(page, '全部');
-    await page.waitForTimeout(500);
-
-    // ── 检查是否已有订单对话框打开 ──
-    let orders = await extractOrdersFromPopup(page);
+    const orders = await extractOrdersFromPopup(page);
     if (orders.length > 0) {
-      console.log(`[浏览器] 订单对话框已打开，提取到 ${orders.length} 条`);
+      console.log(`[浏览器] 从已打开的订单弹窗读取 ${orders.length} 条（只读）`);
       return orders;
     }
-
-    // ── 第1步：搜索含"订单"文字或属性的可点击元素 ──
-    const textBtn = await frame.evaluate(() => {
-      const keywords = ['查看订单', '查看全部订单', '订单详情', '订单'];
-      const candidates = [];
-
-      for (const el of document.querySelectorAll('a, button, [role="button"], span, div, svg, i')) {
-        const text = (el.textContent?.trim() || '').substring(0, 50);
-        const title = el.getAttribute('title') || '';
-        const ariaLabel = el.getAttribute('aria-label') || '';
-
-        const matched = keywords.some(k => text === k || title.includes(k) || ariaLabel.includes(k));
-        if (!matched) continue;
-
-        const rect = el.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) continue;
-        if (rect.width > 300 || rect.height > 80) continue;
-
-        candidates.push({
-          x: rect.x + rect.width / 2,
-          y: rect.y + rect.height / 2,
-          text: text || title || ariaLabel,
-          area: rect.width * rect.height,
-        });
-      }
-
-      candidates.sort((a, b) => a.area - b.area);
-      return candidates.length > 0 ? candidates[0] : null;
-    });
-
-    if (textBtn) {
-      console.log(`[浏览器] 找到订单入口: "${textBtn.text}" (${textBtn.x.toFixed(0)}, ${textBtn.y.toFixed(0)})`);
-      await page.mouse.click(textBtn.x, textBtn.y);
-      await page.waitForTimeout(2000);
-
-      orders = await extractOrdersFromPopup(page);
-      try { await page.keyboard.press('Escape'); await page.waitForTimeout(500); } catch {}
-
-      if (orders.length > 0) {
-        console.log(`[浏览器] 从订单弹窗提取到 ${orders.length} 条订单`);
-        return orders;
-      }
-    }
-
-    // ── 第2步：找到"直播互动"标题旁的小图标按钮，逐个尝试 ──
-    console.log('[浏览器] 搜索"直播互动"区域的工具栏图标...');
-
-    const iconButtons = await frame.evaluate(() => {
-      const icons = [];
-
-      // 找到"直播互动"文本元素
-      let interactionEl = null;
-      for (const el of document.querySelectorAll('*')) {
-        const text = el.textContent?.trim();
-        if (text === '直播互动' || (text?.startsWith('直播互动') && text.length < 15)) {
-          if (el.children.length <= 3) {
-            interactionEl = el;
-            break;
-          }
-        }
-      }
-
-      if (!interactionEl) return icons;
-      const baseRect = interactionEl.getBoundingClientRect();
-
-      // 搜索同一行（Y坐标相近）的小可点击元素
-      // 包含: SVG图标、小按钮、i标签图标等
-      const searchRoot = interactionEl.parentElement?.parentElement || document.body;
-      for (const el of searchRoot.querySelectorAll('svg, button, a, i, [role="button"], span, div')) {
-        const rect = el.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) continue;
-        // 在"直播互动"标题同一行附近（Y偏差<40px）
-        if (Math.abs(rect.y - baseRect.y) > 40) continue;
-        // 小元素（图标大小：10-50px）
-        if (rect.width < 10 || rect.width > 60) continue;
-        if (rect.height < 10 || rect.height > 50) continue;
-        // 排除已知的文字标签
-        const text = el.textContent?.trim() || '';
-        if (['直播互动', '评论', '活跃用户'].includes(text)) continue;
-        if (text.length > 10) continue;
-
-        icons.push({
-          x: rect.x + rect.width / 2,
-          y: rect.y + rect.height / 2,
-          text: text || el.tagName,
-          w: rect.width,
-          h: rect.height,
-        });
-      }
-
-      // 去重（坐标距离<5px的视为同一元素）
-      const unique = [];
-      for (const icon of icons) {
-        if (!unique.some(u => Math.abs(u.x - icon.x) < 5 && Math.abs(u.y - icon.y) < 5)) {
-          unique.push(icon);
-        }
-      }
-      return unique;
-    });
-
-    console.log(`[浏览器] 找到 ${iconButtons.length} 个工具栏图标`);
-
-    for (const icon of iconButtons) {
-      console.log(`[浏览器] 尝试点击图标: "${icon.text}" (${icon.x.toFixed(0)},${icon.y.toFixed(0)}) ${icon.w.toFixed(0)}x${icon.h.toFixed(0)}`);
-      await page.mouse.click(icon.x, icon.y);
-      await page.waitForTimeout(1500);
-
-      orders = await extractOrdersFromPopup(page);
-      if (orders.length > 0) {
-        console.log(`[浏览器] 图标"${icon.text}"打开了订单对话框，提取到 ${orders.length} 条`);
-        return orders;
-      }
-
-      // 没打开订单对话框，按 Escape 关闭可能打开的其他面板
-      try { await page.keyboard.press('Escape'); await page.waitForTimeout(300); } catch {}
-    }
-
-    // ── 第3步：悬停"已下单"条目，寻找右侧入口 ──
-    console.log('[浏览器] 悬停"已下单"条目查找入口...');
-
-    const entryPositions = await frame.evaluate(() => {
-      const positions = [];
-      const seen = new Set();
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
-      while (walker.nextNode()) {
-        const text = walker.currentNode.textContent.trim();
-        if (text !== '已下单') continue;
-        const el = walker.currentNode.parentElement;
-        if (!el) continue;
-        let container = el;
-        for (let i = 0; i < 5; i++) {
-          if (!container.parentElement) break;
-          const pr = container.parentElement.getBoundingClientRect();
-          if (pr.height >= 30 && pr.height <= 150 && pr.width > 100) container = container.parentElement;
-          else if (pr.height > 150) break;
-        }
-        const cr = container.getBoundingClientRect();
-        const key = `${Math.round(cr.y)}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        positions.push({ centerX: cr.x + cr.width / 2, centerY: cr.y + cr.height / 2, rightX: cr.right - 20 });
-      }
-      return positions;
-    });
-
-    const allOrders = [];
-    for (const pos of entryPositions.slice(0, 5)) {
-      await page.mouse.move(pos.centerX, pos.centerY);
-      await page.waitForTimeout(500);
-      await page.mouse.move(pos.rightX, pos.centerY);
-      await page.waitForTimeout(500);
-
-      const hoverBtn = await frame.evaluate((entryY) => {
-        for (const el of document.querySelectorAll('a, button, span, div, [role="button"]')) {
-          const text = (el.textContent?.trim() || el.getAttribute('title') || '').substring(0, 20);
-          if (!text.includes('订单') && !text.includes('查看')) continue;
-          const rect = el.getBoundingClientRect();
-          if (rect.width === 0 || rect.height === 0 || rect.width > 200 || rect.height > 50) continue;
-          if (Math.abs(rect.y + rect.height / 2 - entryY) > 60) continue;
-          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, text };
-        }
-        return null;
-      }, pos.centerY);
-
-      if (!hoverBtn) continue;
-      console.log(`[浏览器] 悬停后找到"${hoverBtn.text}"`);
-      await page.mouse.click(hoverBtn.x, hoverBtn.y);
-      await page.waitForTimeout(2000);
-
-      orders = await extractOrdersFromPopup(page);
-      try { await page.keyboard.press('Escape'); await page.waitForTimeout(500); } catch {}
-      if (orders.length > 0) {
-        allOrders.push(...orders);
-        if (orders.length > 1) break;
-      }
-    }
-
-    console.log(`[浏览器] 共提取到 ${allOrders.length} 条订单`);
-    return allOrders;
+    return [];
   } catch (e) {
-    console.error('[浏览器] 提取订单异常:', e.message);
-    try { await page.keyboard.press('Escape'); } catch {}
+    console.error('[浏览器] 读取订单弹窗异常:', e.message);
     return [];
   }
+}
+
+/**
+ * 针对单条评论：悬停该行 → 点击「查看订单」→ 读取弹窗（无订单则返回 null）
+ *
+ * 订单与评论一一对应：每条评论都尝试查看，弹窗有数据则提取，没有则只记录评论。
+ *
+ * @returns {Object|null} 订单对象 { orderId, orderTime, paymentTime, productTitle }
+ */
+async function viewOrderForComment(page, comment) {
+  const frame = await getContentFrame(page);
+  const hm = comment.time.substring(11, 16); // HH:mm
+
+  const rowPos = await frame.evaluate(({ userId, nickname, hm, content }) => {
+    const contentSnippet = (content || '').trim().replace(/\[-[^\]]+\]/g, '').substring(0, 24);
+
+    for (const item of document.querySelectorAll('.tc-comment-item')) {
+      const nameEl = item.querySelector('.tc-comment-item-userinfo-name');
+      const timeEl = item.querySelector('.alpw-comment-time');
+      const contentEl = item.querySelector('.tc-comment-item-content');
+      if (!nameEl || !timeEl) continue;
+
+      const nameText = (nameEl.textContent || '').trim();
+      const timeText = (timeEl.textContent || '').replace(/\s+/g, '').trim();
+      const contentText = (contentEl?.textContent || '').trim();
+
+      if (!nameText.includes(nickname) || !nameText.includes(userId)) continue;
+      if (!timeText.includes(hm.replace(':', '')) && !timeText.includes(hm)) continue;
+      if (contentSnippet.length >= 2 && !contentText.includes(contentSnippet)) continue;
+
+      const rect = item.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+
+      return {
+        hoverX: rect.x + rect.width * 0.75,
+        hoverY: rect.y + rect.height / 2,
+        preview: `${nameText} ${timeText} ${contentText}`.substring(0, 100),
+      };
+    }
+    return null;
+  }, { userId: comment.userId, nickname: comment.nickname, hm, content: comment.content || '' });
+
+  if (!rowPos) {
+    console.log(`[浏览器] 未找到评论行: ${comment.nickname}(${comment.userId}) ${hm}`);
+    return null;
+  }
+
+  console.log(`[浏览器] 悬停评论: ${rowPos.preview}`);
+  await page.mouse.move(rowPos.hoverX, rowPos.hoverY);
+  await page.waitForTimeout(600);
+
+  let viewBtn = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    viewBtn = await frame.evaluate(({ userId, nickname, hm, content }) => {
+      const contentSnippet = (content || '').trim().replace(/\[-[^\]]+\]/g, '').substring(0, 24);
+
+      for (const item of document.querySelectorAll('.tc-comment-item')) {
+        const nameEl = item.querySelector('.tc-comment-item-userinfo-name');
+        const timeEl = item.querySelector('.alpw-comment-time');
+        const contentEl = item.querySelector('.tc-comment-item-content');
+        if (!nameEl || !timeEl) continue;
+
+        const nameText = (nameEl.textContent || '').trim();
+        const timeText = (timeEl.textContent || '').replace(/\s+/g, '').trim();
+        const contentText = (contentEl?.textContent || '').trim();
+
+        if (!nameText.includes(nickname) || !nameText.includes(userId)) continue;
+        if (!timeText.includes(hm.replace(':', '')) && !timeText.includes(hm)) continue;
+        if (contentSnippet.length >= 2 && !contentText.includes(contentSnippet)) continue;
+
+        const orderBtn = item.querySelector('[data-tblalog-id="chakandingdan"], img[alt="订单"]');
+        if (!orderBtn) continue;
+
+        const clickTarget = orderBtn.closest('.tc-comment-item-action') || orderBtn;
+        const rect = clickTarget.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+
+        const container = item.querySelector('.tc-comment-item-action-container');
+        const containerStyle = container ? getComputedStyle(container) : null;
+        if (containerStyle && containerStyle.display === 'none') continue;
+
+        return {
+          x: rect.x + rect.width / 2,
+          y: rect.y + rect.height / 2,
+        };
+      }
+      return null;
+    }, { userId: comment.userId, nickname: comment.nickname, hm, content: comment.content || '' });
+
+    if (viewBtn) break;
+    await page.mouse.move(rowPos.hoverX, rowPos.hoverY);
+    await page.waitForTimeout(400);
+  }
+
+  if (!viewBtn) {
+    console.log('[浏览器] 悬停后未出现「查看订单」按钮，按无订单处理');
+    return null;
+  }
+
+  console.log('[浏览器] 点击「查看订单」');
+  await page.mouse.click(viewBtn.x, viewBtn.y);
+  await page.waitForTimeout(2000);
+
+  const orders = await extractOrdersFromPopup(page);
+  try {
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(400);
+  } catch {}
+
+  if (orders.length === 0) {
+    console.log('[浏览器] 该评论无关联订单');
+    return null;
+  }
+
+  console.log(`[浏览器] 订单: ${orders[0].orderId}`);
+  return orders[0];
 }
 
 module.exports = {
@@ -1572,5 +1614,6 @@ module.exports = {
   getRecentComments,
   getOrdersFromTab,
   extractAllOrders,
+  viewOrderForComment,
   nowBeijing,
 };

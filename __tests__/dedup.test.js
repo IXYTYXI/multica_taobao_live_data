@@ -76,6 +76,7 @@ describe('记录构造逻辑', () => {
   function buildRecord(comment, orderInfo) {
     return {
       commenterID: comment.userId,
+      commenterName: comment.nickname,
       commentTime: comment.time,
       commentContent: comment.content,
       orderId: orderInfo?.orderId || '',
@@ -84,10 +85,11 @@ describe('记录构造逻辑', () => {
   }
 
   test('有订单信息时完整填充', () => {
-    const comment = { userId: 'u1', time: '14:30', content: 'test' };
+    const comment = { userId: 'u1', nickname: '张三', time: '14:30', content: 'test' };
     const order = { orderId: 'ORD123', paymentTime: '2026-07-10 14:25:00', buyerId: 'b1' };
     const record = buildRecord(comment, order);
     expect(record.commenterID).toBe('u1');
+    expect(record.commenterName).toBe('张三');
     expect(record.orderId).toBe('ORD123');
     expect(record.paymentTime).toBe('2026-07-10 14:25:00');
   });
@@ -105,5 +107,67 @@ describe('记录构造逻辑', () => {
     const record = buildRecord(comment, order);
     expect(record.orderId).toBe('ORD123');
     expect(record.paymentTime).toBe('');
+  });
+});
+
+describe('订单去重逻辑', () => {
+  function resolveOrderFields(matchedOrder, recordedOrderIds, batchOrderIds) {
+    const orderId = (matchedOrder?.orderId || '').trim();
+    const paymentTime = matchedOrder?.paymentTime || '';
+    if (!orderId) {
+      return { orderId: '', paymentTime: '' };
+    }
+    if (recordedOrderIds.has(orderId) || batchOrderIds.has(orderId)) {
+      return { orderId: '', paymentTime: '', duplicate: true };
+    }
+    batchOrderIds.add(orderId);
+    return { orderId, paymentTime, duplicate: false };
+  }
+
+  test('同一订单号在本批次内只保留第一条', () => {
+    const recorded = new Set();
+    const batch = new Set();
+    const order = { orderId: 'ORD999', paymentTime: '2026-07-10 14:25:00' };
+
+    const first = resolveOrderFields(order, recorded, batch);
+    const second = resolveOrderFields(order, recorded, batch);
+
+    expect(first.orderId).toBe('ORD999');
+    expect(first.duplicate).toBeFalsy();
+    expect(second.orderId).toBe('');
+    expect(second.duplicate).toBe(true);
+  });
+
+  test('已持久化的订单号不再写入', () => {
+    const recorded = new Set(['ORD888']);
+    const batch = new Set();
+    const order = { orderId: 'ORD888', paymentTime: '2026-07-10 14:25:00' };
+
+    const result = resolveOrderFields(order, recorded, batch);
+
+    expect(result.orderId).toBe('');
+    expect(result.duplicate).toBe(true);
+    expect(batch.size).toBe(0);
+  });
+
+  test('无订单时返回空字段', () => {
+    const recorded = new Set();
+    const batch = new Set();
+
+    const result = resolveOrderFields(null, recorded, batch);
+
+    expect(result.orderId).toBe('');
+    expect(result.paymentTime).toBe('');
+  });
+
+  test('同一用户不同订单号可以分别保留', () => {
+    const recorded = new Set();
+    const batch = new Set();
+
+    const first = resolveOrderFields({ orderId: 'ORD001', paymentTime: 't1' }, recorded, batch);
+    const second = resolveOrderFields({ orderId: 'ORD002', paymentTime: 't2' }, recorded, batch);
+
+    expect(first.orderId).toBe('ORD001');
+    expect(second.orderId).toBe('ORD002');
   });
 });

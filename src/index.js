@@ -17,8 +17,7 @@ const {
   findActivePage,
   dumpPageDOM,
   getRecentComments,
-  getOrdersFromTab,
-  extractAllOrders,
+  viewOrderForComment,
   nowBeijing,
 } = require('./browser');
 const { writeRecord, writeBatchRecords, findExistingRecordKeys } = require('./feishu');
@@ -26,6 +25,7 @@ const { writeRecord, writeBatchRecords, findExistingRecordKeys } = require('./fe
 // ─── 持久化去重 + outbox ──────────────────────────────────────────
 const DATA_DIR = path.resolve(__dirname, '..', 'data');
 const DEDUP_FILE = path.join(DATA_DIR, 'dedup.json');
+const ORDER_DEDUP_FILE = path.join(DATA_DIR, 'order-dedup.json');
 const OUTBOX_FILE = path.join(DATA_DIR, 'outbox.json');
 
 function ensureDataDir() {
@@ -65,6 +65,31 @@ function saveDedup(set) {
   atomicWrite(DEDUP_FILE, [...set]);
 }
 
+function loadOrderDedup() {
+  const data = loadJSON(ORDER_DEDUP_FILE);
+  return data ? new Set(data) : new Set();
+}
+
+function saveOrderDedup(set) {
+  atomicWrite(ORDER_DEDUP_FILE, [...set]);
+}
+
+/**
+ * 同一订单号只保留一条记录；后续评论若弹窗仍返回该订单，则只写评论不写订单。
+ */
+function resolveOrderFields(matchedOrder, recordedOrderIds, batchOrderIds) {
+  const orderId = (matchedOrder?.orderId || '').trim();
+  const paymentTime = matchedOrder?.paymentTime || '';
+  if (!orderId) {
+    return { orderId: '', paymentTime: '' };
+  }
+  if (recordedOrderIds.has(orderId) || batchOrderIds.has(orderId)) {
+    return { orderId: '', paymentTime: '', duplicate: true };
+  }
+  batchOrderIds.add(orderId);
+  return { orderId, paymentTime, duplicate: false };
+}
+
 function loadOutbox() {
   const data = loadJSON(OUTBOX_FILE);
   return Array.isArray(data) ? data : [];
@@ -79,6 +104,7 @@ function recordKey(r) {
 }
 
 const recordedComments = loadDedup();
+const recordedOrderIds = loadOrderDedup();
 let pendingOutbox = loadOutbox();
 
 
@@ -154,8 +180,10 @@ async function flushRecords(records, { isRetry = false } = {}) {
 
   for (const r of succeeded) {
     recordedComments.add(recordKey(r));
+    if (r.orderId) recordedOrderIds.add(r.orderId);
   }
   saveDedup(recordedComments);
+  saveOrderDedup(recordedOrderIds);
   rebuildOutbox();
 
   const failCount = toSend.length - succeeded.length;
@@ -176,64 +204,40 @@ function rebuildOutbox() {
   saveOutbox(pendingOutbox);
 }
 
+let initialCommentSyncDone = false;
+
 /**
- * 扫描近期评论和"已下单"记录，处理新条目
+ * 扫描近期评论，处理新条目
  *
- * 1. 先从"全部"标签获取评论（包括"已下单"条目）
- * 2. 再从"已下单"标签获取订单条目（可能捕获到"全部"标签遗漏的）
- * 3. 打开订单弹窗提取所有订单（表格结构：商品标题/下单时间/支付时间/订单ID）
- * 4. 按时间匹配关联"已下单"条目与订单ID
+ * 1. 仅在"全部"标签扫描，不来回切换标签
+ * 2. 首次进入中控台同步当前可见的全部评论
+ * 3. 每条新评论：悬停该行 → 点「查看订单」→ 有则写入订单，无则只写评论
+ * 4. 同一订单号只保留一条带订单的记录（用户下单后后续评论可能重复带出同一订单）
  */
 async function processNewComments(page) {
-  // 1. 获取"全部"标签中的评论
-  const result = await getRecentComments(page, config.monitor.commentCheckMinutes);
+  const syncAllVisible = !initialCommentSyncDone;
+  const result = await getRecentComments(page, config.monitor.commentCheckMinutes, { syncAllVisible });
+  initialCommentSyncDone = true;
 
   if (result.error) {
     console.error('[主程序] 采集评论出错，跳过本轮:', result.error);
     return false;
   }
 
-  // 2. 获取"已下单"标签中的订单记录
-  const orderResult = await getOrdersFromTab(page, config.monitor.commentCheckMinutes);
-  if (orderResult.error) {
-    console.log('[主程序] "已下单"标签采集失败，仅处理评论:', orderResult.error);
-  }
-
-  // 3. 合并：评论 + 订单条目，按 key 去重
   const allEntries = [...result.comments];
-  const seenKeys = new Set(allEntries.map(c => `${c.userId}_${c.time}_${c.content}`));
-  for (const order of (orderResult.orders || [])) {
-    const key = `${order.userId}_${order.time}_${order.content}`;
-    if (!seenKeys.has(key)) {
-      allEntries.push(order);
-      seenKeys.add(key);
-    }
-  }
 
   if (allEntries.length === 0) {
     console.log('[主程序] 近期无新评论或订单');
     return true;
   }
 
-  // 4. 检查是否有新的"已下单"条目需要关联订单
-  const hasNewOrderEntries = allEntries.some(e => {
-    const k = recordKey({ commenterID: e.userId, commentTime: e.time, commentContent: e.content });
-    return !recordedComments.has(k) &&
-      (e.content === '已下单' || (e.content && e.content.includes('已下单')));
-  });
-
-  // 5. 如果有新的"已下单"条目，打开订单弹窗提取全部订单
-  let allOrders = [];
-  if (hasNewOrderEntries) {
-    allOrders = await extractAllOrders(page);
-    if (allOrders.length > 0) {
-      console.log(`[主程序] 从订单弹窗获取到 ${allOrders.length} 条订单`);
-    }
+  const orderEntryCount = allEntries.filter(e => e.content && e.content.includes('已下单')).length;
+  if (orderEntryCount > 0) {
+    console.log(`[主程序] 本轮含 ${orderEntryCount} 条带「已下单」标记的评论（仅供参考）`);
   }
 
-  // 6. 处理所有条目
   const newRecords = [];
-  const usedOrderIds = new Set();
+  const batchOrderIds = new Set();
 
   for (const comment of allEntries) {
     const key = `${comment.userId}_${comment.time}_${comment.content}`;
@@ -243,47 +247,23 @@ async function processNewComments(page) {
 
     console.log(`[主程序] 处理: ${comment.nickname}(${comment.userId}) ${comment.time} - ${comment.content}`);
 
-    // 对"已下单"条目，按分钟级时间匹配订单
-    let matchedOrder = null;
-    const isOrderEntry = comment.content === '已下单' || (comment.content && comment.content.includes('已下单'));
-
-    if (isOrderEntry && allOrders.length > 0) {
-      const commentMinute = comment.time.substring(0, 16); // "YYYY-MM-DD HH:mm"
-      for (const order of allOrders) {
-        if (usedOrderIds.has(order.orderId)) continue;
-        const orderTimeNorm = (order.orderTime || order.paymentTime || '').substring(0, 16);
-        if (commentMinute === orderTimeNorm) {
-          matchedOrder = order;
-          usedOrderIds.add(order.orderId);
-          console.log(`[主程序] 匹配到订单: ${order.orderId}`);
-          break;
-        }
-      }
-      if (!matchedOrder) {
-        // 放宽到±2分钟内匹配
-        const cParts = commentMinute.split(/[-: T]/);
-        const cMin = parseInt(cParts[3] || '0', 10) * 60 + parseInt(cParts[4] || '0', 10);
-        for (const order of allOrders) {
-          if (usedOrderIds.has(order.orderId)) continue;
-          const oTime = (order.orderTime || order.paymentTime || '').substring(0, 16);
-          const oParts = oTime.split(/[-: T]/);
-          const oMin = parseInt(oParts[3] || '0', 10) * 60 + parseInt(oParts[4] || '0', 10);
-          if (Math.abs(cMin - oMin) <= 2) {
-            matchedOrder = order;
-            usedOrderIds.add(order.orderId);
-            console.log(`[主程序] 近似匹配到订单: ${order.orderId}`);
-            break;
-          }
-        }
-      }
+    const matchedOrder = await viewOrderForComment(page, comment);
+    const { orderId, paymentTime, duplicate } = resolveOrderFields(
+      matchedOrder,
+      recordedOrderIds,
+      batchOrderIds
+    );
+    if (duplicate) {
+      console.log(`[主程序] 订单 ${matchedOrder.orderId} 已记录，本条仅保存评论`);
     }
 
     const record = {
       commenterID: comment.userId,
+      commenterName: comment.nickname,
       commentTime: comment.time,
       commentContent: comment.content,
-      orderId: matchedOrder?.orderId || '',
-      paymentTime: matchedOrder?.paymentTime || '',
+      orderId,
+      paymentTime,
     };
 
     newRecords.push(record);
@@ -299,7 +279,7 @@ async function processNewComments(page) {
 
 /**
  * 主监控循环
- * 每轮周期性扫描评论区，处理新评论和"已下单"订单，不再依赖成交人数作为触发条件。
+ * 每轮周期性扫描评论区，对每条新评论尝试查看订单并写入飞书。
  */
 async function monitorLoop(page) {
   const intervalMs = config.monitor.intervalSeconds * 1000;
@@ -391,11 +371,12 @@ async function main() {
 // 优雅退出 — 确保去重集合和 outbox 持久化
 function gracefulExit(signal) {
   console.log(`\n[主程序] 收到 ${signal} 信号，正在退出...`);
-  console.log(`[主程序] 本次运行共记录 ${recordedComments.size} 条评论`);
+  console.log(`[主程序] 本次运行共记录 ${recordedComments.size} 条评论，${recordedOrderIds.size} 个订单`);
   if (pendingOutbox.length > 0) {
     console.log(`[主程序] ${pendingOutbox.length} 条记录未成功写入，已保存到 outbox，下次启动时重试`);
   }
   saveDedup(recordedComments);
+  saveOrderDedup(recordedOrderIds);
   saveOutbox(pendingOutbox);
   process.exit(0);
 }
