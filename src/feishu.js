@@ -46,6 +46,27 @@ function toTimestampMs(dateStr) {
   }
 }
 
+/**
+ * 构造飞书多维表格字段
+ * 用户ID = 昵称/显示名；用户实际id = 淘宝账号 ID（如 tb0053776_2012）
+ */
+function buildFeishuFields(record) {
+  const fields = {
+    '用户ID': record.commenterName || record.commenterID || '',
+    '用户实际id': record.commenterID || '',
+    '用户评论': record.commentContent || '',
+    '评论时间': record.commentTime || '',
+    '订单编号': record.orderId || '',
+  };
+
+  const payTs = toTimestampMs(record.paymentTime);
+  if (payTs) {
+    fields['支付时间'] = payTs;
+  }
+
+  return fields;
+}
+
 let cachedToken = null;
 let tokenExpiresAt = 0;
 
@@ -81,7 +102,8 @@ async function getTenantAccessToken() {
 /**
  * 向飞书多维表格写入一条记录
  * @param {Object} record - 要写入的记录
- * @param {string} record.commenterID - 评论者ID
+ * @param {string} record.commenterID - 评论者实际 ID（淘宝账号）
+ * @param {string} record.commenterName - 评论者昵称/显示名
  * @param {string} record.commentTime - 评论时间
  * @param {string} record.commentContent - 评论内容
  * @param {string} record.orderId - 订单ID
@@ -91,19 +113,7 @@ async function writeRecord(record) {
   const token = await getTenantAccessToken();
   const { baseAppToken, tableId } = config.feishu;
 
-  // 字段名对应飞书表格实际列名
-  const fields = {
-    '用户ID': record.commenterID || '',
-    '用户评论': record.commentContent || '',
-    '评论时间': record.commentTime || '',
-    '订单编号': record.orderId || '',
-  };
-
-  // 支付时间是日期字段（type 5），需要毫秒时间戳
-  const payTs = toTimestampMs(record.paymentTime);
-  if (payTs) {
-    fields['支付时间'] = payTs;
-  }
+  const fields = buildFeishuFields(record);
 
   const res = await axios.post(
     `${FEISHU_BASE}/bitable/v1/apps/${baseAppToken}/tables/${tableId}/records`,
@@ -121,7 +131,7 @@ async function writeRecord(record) {
     throw new Error(`写入飞书失败: ${JSON.stringify(res.data)}`);
   }
 
-  console.log(`[飞书] 写入成功: ${record.commenterID} - ${record.commentContent}`);
+  console.log(`[飞书] 写入成功: ${record.commenterName || record.commenterID}(${record.commenterID}) - ${record.commentContent}`);
   return res.data;
 }
 
@@ -135,19 +145,9 @@ async function writeBatchRecords(records) {
   const token = await getTenantAccessToken();
   const { baseAppToken, tableId } = config.feishu;
 
-  const batchRecords = records.map((record) => {
-    const fields = {
-      '用户ID': record.commenterID || '',
-      '用户评论': record.commentContent || '',
-      '评论时间': record.commentTime || '',
-      '订单编号': record.orderId || '',
-    };
-    const payTs = toTimestampMs(record.paymentTime);
-    if (payTs) {
-      fields['支付时间'] = payTs;
-    }
-    return { fields };
-  });
+  const batchRecords = records.map((record) => ({
+    fields: buildFeishuFields(record),
+  }));
 
   const res = await axios.post(
     `${FEISHU_BASE}/bitable/v1/apps/${baseAppToken}/tables/${tableId}/records/batch_create`,
@@ -184,14 +184,14 @@ async function findExistingRecordKeys(records) {
 
   for (const record of records) {
     try {
-      const filter = `AND(CurrentValue.[用户ID]="${record.commenterID}",CurrentValue.[评论时间]="${record.commentTime}")`;
+      const filter = `AND(CurrentValue.[用户实际id]="${record.commenterID}",CurrentValue.[评论时间]="${record.commentTime}")`;
       const res = await axios.get(
         `${FEISHU_BASE}/bitable/v1/apps/${baseAppToken}/tables/${tableId}/records`,
         {
           params: {
             filter,
             page_size: 20,
-            field_names: JSON.stringify(['用户ID', '评论时间', '用户评论']),
+            field_names: JSON.stringify(['用户实际id', '评论时间', '用户评论']),
           },
           headers: { Authorization: `Bearer ${token}` },
           timeout: REQUEST_TIMEOUT_MS,
@@ -215,4 +215,4 @@ async function findExistingRecordKeys(records) {
   return existingKeys;
 }
 
-module.exports = { writeRecord, writeBatchRecords, findExistingRecordKeys };
+module.exports = { writeRecord, writeBatchRecords, findExistingRecordKeys, buildFeishuFields };

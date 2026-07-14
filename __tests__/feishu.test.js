@@ -117,6 +117,7 @@ describe('feishu.js API 调用', () => {
 
     await writeRecord({
       commenterID: 'user_001',
+      commenterName: '测试用户',
       commentTime: '2026-07-10 14:30:00',
       commentContent: '好看的',
       orderId: 'ORD123456789',
@@ -127,7 +128,8 @@ describe('feishu.js API 调用', () => {
     const writeCall = axios.post.mock.calls[1];
     expect(writeCall[0]).toContain('/bitable/v1/apps/mock_base_token/tables/mock_table_id/records');
     const body = writeCall[1];
-    expect(body.fields['用户ID']).toBe('user_001');
+    expect(body.fields['用户ID']).toBe('测试用户');
+    expect(body.fields['用户实际id']).toBe('user_001');
     expect(body.fields['用户评论']).toBe('好看的');
     expect(body.fields['评论时间']).toBe('2026-07-10 14:30:00');
     expect(body.fields['订单编号']).toBe('ORD123456789');
@@ -217,15 +219,16 @@ describe('feishu.js API 调用', () => {
     const { writeBatchRecords } = require('../src/feishu');
 
     await writeBatchRecords([
-      { commenterID: 'u1', commentContent: 'c1', commentTime: 't1', orderId: '', paymentTime: '' },
-      { commenterID: 'u2', commentContent: 'c2', commentTime: 't2', orderId: 'ORD001', paymentTime: '2026-07-10 12:00:00' },
+      { commenterID: 'u1', commenterName: '用户甲', commentContent: 'c1', commentTime: 't1', orderId: '', paymentTime: '' },
+      { commenterID: 'u2', commenterName: '用户乙', commentContent: 'c2', commentTime: 't2', orderId: 'ORD001', paymentTime: '2026-07-10 12:00:00' },
     ]);
 
     const writeCall = axios.post.mock.calls[1];
     expect(writeCall[0]).toContain('batch_create');
     const body = writeCall[1];
     expect(body.records).toHaveLength(2);
-    expect(body.records[0].fields['用户ID']).toBe('u1');
+    expect(body.records[0].fields['用户ID']).toBe('用户甲');
+    expect(body.records[0].fields['用户实际id']).toBe('u1');
     expect(body.records[1].fields['订单编号']).toBe('ORD001');
   });
 });
