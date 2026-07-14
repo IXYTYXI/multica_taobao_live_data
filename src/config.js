@@ -51,6 +51,12 @@ const config = {
     startupBackfill: process.env.STARTUP_BACKFILL !== 'false',
     // 定时滚动兜底间隔（小时），防止虚拟列表衔接断层；0 表示关闭
     periodicBackfillHours: parseFloat(process.env.PERIODIC_BACKFILL_HOURS || '3', 10),
+    // 浏览器意外关闭后自动重新打开并回到中控台（默认开启）
+    autoRecoverBrowser: process.env.AUTO_RECOVER_BROWSER !== 'false',
+    // 定时刷新中控台页面（分钟），防止评论区卡死；0 表示关闭，默认 30
+    pageRefreshMinutes: parseFloat(process.env.PAGE_REFRESH_MINUTES || '30', 10),
+    // 连续 N 轮扫描异常后触发刷新（默认 3）
+    staleScanThreshold: parseInt(process.env.STALE_SCAN_THRESHOLD || '3', 10),
   },
 };
 
