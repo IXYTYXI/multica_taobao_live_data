@@ -47,10 +47,10 @@
 | 浏览器 | **Google Chrome**（非 Chromium 包） | 工具通过 Playwright `channel: 'chrome'` 调用本机 Chrome |
 | 操作系统 | Windows 10/11 或 macOS | Linux 未专门测试；Windows 见下方专节 |
 | 网络 | 可访问淘宝直播中控台与飞书 Open API | 公司网络需放行相关域名 |
-| 飞书 | 企业自建应用 + 多维表格授权 | 见 [步骤 4：飞书表格](#deploy-step-feishu) |
+| 飞书 | 企业自建应用 + 多维表格授权 | 见 [步骤 4：飞书表格](#4-准备飞书多维表格) |
 | Git | 可选 | 用于 `git clone`；也可直接下载 ZIP |
 
-验证 Node.js 是否就绪见 [阶段 0：机器环境](#deploy-step-0)。
+验证 Node.js 是否就绪见 [阶段 0：机器环境](#阶段-0机器环境clone-之前)。
 
 ---
 
@@ -58,21 +58,19 @@
 
 很多人以为 **clone → 改 `.env` → `npm start`** 就能「全部配置成功」。实际上这只覆盖**启动采集进程**；其他环节需单独准备或执行。
 
-<a id="deploy-checklist"></a>
-
 ### 对照表
 
 | # | 配置 / 步骤 | 改 `.env` + `npm start` 是否足够 | 详见（含可复制命令） |
 |---|-------------|----------------------------------|----------------------|
-| ① | 飞书凭证、采集间隔等 | ✅ | [步骤 3：配置 .env](#deploy-step-env) → [步骤 5：启动](#deploy-step-start) |
-| ② | Node.js 运行环境 | ❌ | [阶段 0：安装 Node.js](#deploy-step-0) |
-| ③ | npm 项目依赖 | ❌ | [步骤 1–2：clone 与 install](#deploy-step-clone) |
-| ④ | Google Chrome | ❌ | [阶段 0：安装 Chrome](#deploy-step-0) |
-| ⑤ | 首次淘宝登录 | ❌ | [步骤 5：首次启动](#deploy-step-start) |
-| ⑥ | 飞书应用权限与表格列 | ❌ | [步骤 4：飞书表格](#deploy-step-feishu) |
-| ⑦ | 长期后台运行（pm2） | ❌ | [步骤 7：pm2 守护](#deploy-step-pm2) |
-| ⑧ | 每天定时启停 | ❌ | [步骤 8：定时启停](#deploy-step-schedule) |
-| ⑨ | 7×24 开机自启 | ❌ | [长期运行：pm2 startup](#deploy-step-startup) |
+| ① | 飞书凭证、采集间隔等 | ✅ | [步骤 3：配置 .env](#3-配置环境变量) → [步骤 5：启动](#5-首次启动阶段-2验证采集) |
+| ② | Node.js 运行环境 | ❌ | [阶段 0：安装 Node.js](#阶段-0机器环境clone-之前) |
+| ③ | npm 项目依赖 | ❌ | [步骤 1–2：clone 与 install](#1-获取代码) |
+| ④ | Google Chrome | ❌ | [阶段 0：安装 Chrome](#阶段-0机器环境clone-之前) |
+| ⑤ | 首次淘宝登录 | ❌ | [步骤 5：首次启动](#5-首次启动阶段-2验证采集) |
+| ⑥ | 飞书应用权限与表格列 | ❌ | [步骤 4：飞书表格](#4-准备飞书多维表格) |
+| ⑦ | 长期后台运行（pm2） | ❌ | [步骤 7：pm2 守护](#7-可选pm2-守护阶段-3长期运行) |
+| ⑧ | 每天定时启停 | ❌ | [步骤 8：定时启停](#8-可选每日定时启停阶段-4) |
+| ⑨ | 7×24 开机自启 | ❌ | [长期运行：pm2 startup](#使用-pm2-守护推荐) |
 
 > 命令均在下文 [快速部署（完整清单）](#快速部署完整清单) 对应步骤中，此处只做索引跳转，避免重复。
 
@@ -86,17 +84,15 @@
 
 仅在 `BROWSER_MODE=cdp` 时，需手动用调试端口启动 Chrome（见 [浏览器模式](#浏览器模式)）。
 
-<a id="deploy-goals"></a>
-
 ### 三种部署目标
 
 | 目标 | 跳转 |
 |------|------|
-| **A. 临时试跑** | [一键复制：从零到可采集](#deploy-quick-a) |
-| **B. 长期采集（手动启停）** | A + [步骤 7：pm2 守护](#deploy-step-pm2) |
-| **C. 每天固定时段自动启停** | B + [步骤 8：定时启停](#deploy-step-schedule) |
+| **A. 临时试跑** | [一键复制：从零到可采集](#一键复制从零到可采集目标-a) |
+| **B. 长期采集（手动启停）** | A + [步骤 7：pm2 守护](#7-可选pm2-守护阶段-3长期运行) |
+| **C. 每天固定时段自动启停** | B + [步骤 8：定时启停](#8-可选每日定时启停阶段-4) |
 
-[↑ 返回对照表](#deploy-checklist)
+[↑ 返回对照表](#对照表)
 
 ---
 
@@ -228,13 +224,11 @@ pm2 startup
 
 ## 快速部署（完整清单）
 
-按顺序勾选，**全部打勾后再认为部署完成**。各步骤下方可 [↑ 返回对照表](#deploy-checklist) 查看整体进度。
-
-<a id="deploy-step-0"></a>
+按顺序勾选，**全部打勾后再认为部署完成**。各步骤下方可 [↑ 返回对照表](#对照表) 查看整体进度。
 
 ### 阶段 0：机器环境（clone 之前）
 
-> ↑ [返回对照表](#deploy-checklist)（对应 **②** Node.js · **④** Chrome）
+> ↑ [返回对照表](#对照表)（对应 **②** Node.js · **④** Chrome）
 
 - [ ] 已安装 **Node.js ≥ 18**
 - [ ] 已安装 **Google Chrome**（非 Edge/Firefox；工具指定 `channel: 'chrome'`）
@@ -276,11 +270,9 @@ winget install Google.Chrome
 
 ### 阶段 1：获取代码与依赖
 
-<a id="deploy-step-clone"></a>
-
 ### 1. 获取代码
 
-> ↑ [返回对照表](#deploy-checklist)（对应 **③** npm 项目依赖）
+> ↑ [返回对照表](#对照表)（对应 **③** npm 项目依赖）
 
 ```bash
 git clone https://github.com/IXYTYXI/multica_taobao_live_data.git
@@ -302,13 +294,11 @@ npm install
 
 安装 `playwright`、`axios`、`dotenv` 等 Node 依赖。**无需**额外修改项目内 JS 配置。
 
-> **说明**：运行时调用本机 Google Chrome，**通常不需要** `npx playwright install chromium`。若报 Chrome 找不到，见 [阶段 0](#deploy-step-0)。
-
-<a id="deploy-step-env"></a>
+> **说明**：运行时调用本机 Google Chrome，**通常不需要** `npx playwright install chromium`。若报 Chrome 找不到，见 [阶段 0](#阶段-0机器环境clone-之前)。
 
 ### 3. 配置环境变量
 
-> ↑ [返回对照表](#deploy-checklist)（对应 **①** 飞书凭证、采集间隔）
+> ↑ [返回对照表](#对照表)（对应 **①** 飞书凭证、采集间隔）
 
 ```bash
 cp .env.example .env
@@ -359,11 +349,9 @@ COMMENT_CHECK_MINUTES=5
 
 > **注意**：`.env` 含敏感信息，勿提交到 Git。完整变量说明见 [配置说明](#配置说明) 与 `.env.example`。
 
-<a id="deploy-step-feishu"></a>
-
 ### 4. 准备飞书多维表格
 
-> ↑ [返回对照表](#deploy-checklist)（对应 **⑥** 飞书应用权限与表格列）
+> ↑ [返回对照表](#对照表)（对应 **⑥** 飞书应用权限与表格列）
 
 目标数据表需包含以下字段（列名须一致）：
 
@@ -391,11 +379,9 @@ COMMENT_CHECK_MINUTES=5
 
 在飞书开放平台 → 应用 → 权限管理 → 多维表格，将目标 Base 授权给该应用。
 
-<a id="deploy-step-start"></a>
-
 ### 5. 首次启动（阶段 2：验证采集）
 
-> ↑ [返回对照表](#deploy-checklist)（对应 **①** 启动生效 · **⑤** 首次淘宝登录）
+> ↑ [返回对照表](#对照表)（对应 **①** 启动生效 · **⑤** 首次淘宝登录）
 
 - [ ] 已在项目根目录执行 `npm start`
 - [ ] 已在弹出 Chrome 中**手动完成**淘宝/直播中控台登录（仅首次或 Cookie 过期时）
@@ -423,11 +409,9 @@ npm start
 - 工具会在评论行上悬停并点击「查看订单」，属于正常行为
 - 直播进行中建议保持 `SCROLL_ON_SYNC` 未开启（默认 `false`），避免滚动干扰界面
 
-<a id="deploy-step-pm2"></a>
-
 ### 7. 可选：pm2 守护（阶段 3：长期运行）
 
-> ↑ [返回对照表](#deploy-checklist)（对应 **⑦** 长期后台运行）
+> ↑ [返回对照表](#对照表)（对应 **⑦** 长期后台运行）
 
 若需进程崩溃自动拉起、或配合定时启停，需**额外**配置 pm2（`npm start` 不会自动完成）：
 
@@ -447,13 +431,11 @@ pm2 stop taobao-live    # 停止
 
 进程名需与 `.env` 中 `SCHEDULE_PM2_NAME`（默认 `taobao-live`）一致。
 
-若需 **7×24 开机自启**，见 [长期运行：pm2 startup](#deploy-step-startup)（与下方定时启停二选一）。
-
-<a id="deploy-step-schedule"></a>
+若需 **7×24 开机自启**，见 [长期运行：pm2 startup](#使用-pm2-守护推荐)（与下方定时启停二选一）。
 
 ### 8. 可选：每日定时启停（阶段 4）
 
-> ↑ [返回对照表](#deploy-checklist)（对应 **⑧** 每天定时启停）
+> ↑ [返回对照表](#对照表)（对应 **⑧** 每天定时启停）
 
 **仅在需要每天固定时段采集时配置。** 在 `.env` 写好时间后，必须单独执行 `schedule:install`：
 
@@ -475,11 +457,9 @@ npm run schedule:status
 
 详见 [定时启停](#定时启停0800-启动--0006-停止) 专节。
 
-<a id="deploy-quick-a"></a>
-
 ### 一键复制：从零到可采集（目标 A）
 
-> ↑ [返回对照表](#deploy-checklist) · [三种部署目标 A](#deploy-goals)
+> ↑ [返回对照表](#对照表) · [三种部署目标 A](#三种部署目标)
 
 ```bash
 # 前提：本机已装 Node.js ≥ 18、Google Chrome
@@ -492,11 +472,9 @@ npm start
 # 在弹出 Chrome 中完成首次登录
 ```
 
-<a id="deploy-quick-c"></a>
-
 ### 一键复制：从零到定时采集（目标 C）
 
-> ↑ [返回对照表](#deploy-checklist) · [三种部署目标 C](#deploy-goals)
+> ↑ [返回对照表](#对照表) · [三种部署目标 C](#三种部署目标)
 
 ```bash
 git clone https://github.com/IXYTYXI/multica_taobao_live_data.git
@@ -777,11 +755,9 @@ scripts\windows\schedule-stop.bat
 | 不关闭采集用 Chrome | 关闭后报 `page has been closed` |
 | 进程守护 | Node 崩溃后需自动拉起 |
 
-<a id="deploy-step-startup"></a>
-
 ### 使用 pm2 守护（推荐）
 
-> ↑ [返回对照表](#deploy-checklist)（对应 **⑨** 7×24 开机自启）
+> ↑ [返回对照表](#对照表)（对应 **⑨** 7×24 开机自启）
 
 ```bash
 npm install -g pm2
