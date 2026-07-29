@@ -1,5 +1,6 @@
 node_modules/
 .env
 *.log
+logs/
 chrome-data/
 data/
