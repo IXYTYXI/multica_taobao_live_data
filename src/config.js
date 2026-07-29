@@ -51,6 +51,8 @@ const config = {
     startupBackfill: process.env.STARTUP_BACKFILL !== 'false',
     // 定时滚动兜底间隔（小时），防止虚拟列表衔接断层；0 表示关闭
     periodicBackfillHours: parseFloat(process.env.PERIODIC_BACKFILL_HOURS || '3', 10),
+    // 兜底前向上滑动次数：仅用于将互动列表拉到顶部，之后只录入一遍
+    backfillScrollUpSteps: parseInt(process.env.BACKFILL_SCROLL_UP_STEPS || '20', 10),
     // 浏览器意外关闭后自动重新打开并回到中控台（默认开启）
     autoRecoverBrowser: process.env.AUTO_RECOVER_BROWSER !== 'false',
     // 定时刷新中控台页面（分钟），防止评论区卡死；0 表示关闭，默认 30

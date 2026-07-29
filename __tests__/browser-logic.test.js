@@ -298,3 +298,35 @@ describe('nowBeijing 时区', () => {
     expect(formatted).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
   });
 });
+
+// ─── 多订单取最新 ─────────────────────────────────────────────────────
+
+const { pickLatestOrder } = require('../src/browser');
+
+describe('pickLatestOrder 多订单取最新', () => {
+  test('两条订单取支付时间较新的', () => {
+    const orders = [
+      {
+        orderId: '3312237255012021592',
+        orderTime: '2026-07-15 11:20:29',
+        paymentTime: '2026-07-15 11:20:35',
+      },
+      {
+        orderId: '3312799321456021592',
+        orderTime: '2026-07-15 15:00:01',
+        paymentTime: '2026-07-15 15:00:20',
+      },
+    ];
+    const latest = pickLatestOrder(orders);
+    expect(latest.orderId).toBe('3312799321456021592');
+  });
+
+  test('仅一条订单直接返回', () => {
+    const orders = [{ orderId: '123', paymentTime: '2026-07-15 10:00:00' }];
+    expect(pickLatestOrder(orders).orderId).toBe('123');
+  });
+
+  test('空数组返回 null', () => {
+    expect(pickLatestOrder([])).toBeNull();
+  });
+});

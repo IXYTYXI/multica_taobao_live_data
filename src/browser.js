@@ -387,6 +387,39 @@ function isRecoverablePageError(message) {
 }
 
 /**
+ * 关闭 Playwright 浏览器会话（login 模式会退出 chrome-data 对应 Chrome 窗口）
+ * @param {{ browser?: import('playwright').Browser|null, context?: import('playwright').BrowserContext|null }|null} session
+ */
+async function closeBrowserSession(session) {
+  if (!session) return;
+
+  const { browser, context } = session;
+
+  if (context) {
+    try {
+      await context.close();
+      console.log('[浏览器] 已关闭浏览器 context');
+    } catch (e) {
+      console.log('[浏览器] 关闭 context 异常:', e.message);
+    }
+  }
+
+  if (browser) {
+    try {
+      await browser.close();
+      console.log('[浏览器] 已关闭 browser 连接');
+    } catch (e) {
+      console.log('[浏览器] 关闭 browser 异常:', e.message);
+    }
+  }
+
+  session.browser = null;
+  session.context = null;
+  session.listPage = null;
+  session.activePage = null;
+}
+
+/**
  * 判断页面是否仍可用于采集
  */
 async function isPageUsable(page) {
@@ -1143,6 +1176,43 @@ function parseCommentTime(timeStr) {
 }
 
 /**
+ * 解析订单弹窗中的完整日期时间（如 2026/07/15 15:00:20）
+ */
+function parseOrderTime(timeStr) {
+  if (!timeStr || !String(timeStr).trim()) return null;
+  const normalized = String(timeStr).replace(/\//g, '-').trim();
+  let t = dayjs.tz(normalized, 'YYYY-MM-DD HH:mm:ss', BEIJING_TZ);
+  if (!t.isValid()) {
+    t = dayjs.tz(normalized, 'YYYY-MM-DD HH:mm', BEIJING_TZ);
+  }
+  return t.isValid() ? t : null;
+}
+
+/**
+ * 多条订单时取时间最新的一条（优先支付时间，其次下单时间）
+ */
+function pickLatestOrder(orders) {
+  if (!orders || orders.length === 0) return null;
+  if (orders.length === 1) return orders[0];
+
+  const score = (o) => parseOrderTime(o.paymentTime) || parseOrderTime(o.orderTime);
+
+  let best = orders[0];
+  let bestTs = score(best);
+
+  for (let i = 1; i < orders.length; i++) {
+    const ts = score(orders[i]);
+    if (!ts) continue;
+    if (!bestTs || ts.isAfter(bestTs)) {
+      best = orders[i];
+      bestTs = ts;
+    }
+  }
+
+  return best;
+}
+
+/**
  * 获取近期评论（仅在"全部"标签扫描，含"已下单"类条目，不切换标签）
  *
  * @param {import('playwright').Page} page
@@ -1153,23 +1223,9 @@ function parseCommentTime(timeStr) {
  */
 async function scrollCommentList(page, frame) {
   console.log('[浏览器] 在直播互动评论列表内滚动加载...');
-  await scrollCommentListStep(frame, 'end');
-  await page.waitForTimeout(200);
-
-  for (let i = 0; i < 80; i++) {
-    const s = await scrollCommentListStep(frame, 'up');
-    if (!s.found) {
-      console.log('[浏览器] 未找到评论列表滚动容器');
-      break;
-    }
-    await page.waitForTimeout(120);
-    if (s.atTop) break;
-  }
-
-  await scrollCommentListStep(frame, 'end');
-  await page.waitForTimeout(200);
+  await scrollCommentListUp(page);
+  await scrollCommentListToBottom(page);
   console.log('[浏览器] 评论列表滚动完成');
-  await page.waitForTimeout(400);
 }
 
 /** 在 frame 内扫描当前可见评论（element-scan + innerText） */
@@ -1347,28 +1403,27 @@ async function scrollCommentListStep(frame, direction = 'down') {
       return best;
     }
 
-    /** 评论列表滚动容器：含 .tc-comment-item 的 scroll 区域，非整页 */
+    /** 评论列表滚动容器：必须在「直播互动」面板内，禁止滚整页 */
     function findCommentListScroller() {
-      const sample = document.querySelector('.tc-comment-item');
+      const root = findInteractionRoot();
+      if (!root) return null;
+
+      const sample = root.querySelector('.tc-comment-item');
       if (sample) {
         let el = sample.parentElement;
-        while (el) {
+        while (el && root.contains(el)) {
           const style = window.getComputedStyle(el);
           const rect = el.getBoundingClientRect();
           if (
             (style.overflowY === 'auto' || style.overflowY === 'scroll') &&
             el.scrollHeight > el.clientHeight + 30 &&
-            rect.width > 0 &&
-            rect.left < window.innerWidth * 0.6
+            rect.width > 0
           ) {
             return el;
           }
           el = el.parentElement;
         }
       }
-
-      const root = findInteractionRoot();
-      if (!root) return null;
 
       let best = null;
       let bestCount = 0;
@@ -1377,7 +1432,7 @@ async function scrollCommentListStep(frame, direction = 'down') {
         if (!(style.overflowY === 'auto' || style.overflowY === 'scroll')) continue;
         if (el.scrollHeight <= el.clientHeight + 30) continue;
         const rect = el.getBoundingClientRect();
-        if (rect.width === 0 || rect.left > window.innerWidth * 0.55) continue;
+        if (rect.width === 0) continue;
         const count = el.querySelectorAll('.tc-comment-item').length;
         if (count > bestCount) {
           bestCount = count;
@@ -1387,13 +1442,18 @@ async function scrollCommentListStep(frame, direction = 'down') {
       return best;
     }
 
+    const root = findInteractionRoot();
     const scroller = findCommentListScroller();
-    if (!scroller) return { found: false };
+    if (!scroller) return { found: false, inInteractionPanel: false };
 
     const step = Math.max(scroller.clientHeight * 0.75, 120);
     const prevTop = scroller.scrollTop;
-    if (dir === 'up') {
+    if (dir === 'read') {
+      // 只读，不滚动
+    } else if (dir === 'up') {
       scroller.scrollTop = Math.max(0, scroller.scrollTop - step);
+    } else if (dir === 'top') {
+      scroller.scrollTop = 0;
     } else if (dir === 'end') {
       scroller.scrollTop = scroller.scrollHeight;
     } else {
@@ -1402,8 +1462,9 @@ async function scrollCommentListStep(frame, direction = 'down') {
 
     return {
       found: true,
-      moved: scroller.scrollTop !== prevTop,
-      atTop: scroller.scrollTop <= 5,
+      inInteractionPanel: !!(root && root.contains(scroller)),
+      moved: dir === 'read' ? false : scroller.scrollTop !== prevTop,
+      atTop: scroller.scrollTop <= 1,
       atEnd: scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 5,
       scrollTop: scroller.scrollTop,
       scrollHeight: scroller.scrollHeight,
@@ -1444,8 +1505,73 @@ async function scrollCommentItemIntoView(page, itemHandle) {
 }
 
 /**
- * 启动兜底：滚动加载并合并整场直播目前已加载的全部评论
- * 适用于程序启动时直播已在进行的情况
+ * 从评论列表顶部逐屏向下：扫描当前可见评论 → 回调处理（查订单、写飞书）
+ * 必须在 DOM 仍可见时处理，避免虚拟列表卸载后找不到行。
+ * @param {import('playwright').Page} page
+ * @param {(comments: Array, meta: { step: number, totalSeen: number }) => Promise<void>} onBatch
+ */
+async function processCommentsFromTopDown(page, onBatch) {
+  const frame = await getContentFrame(page);
+  await ensureCommentTab(page, '全部');
+  await scrollCommentListStep(frame, 'top');
+  await page.waitForTimeout(400);
+
+  const seenKeys = new Set();
+  const allComments = [];
+  let stagnant = 0;
+  const maxSteps = 200;
+  const stagnantThreshold = 6;
+
+  console.log('[浏览器] 在「直播互动」列表内从顶部向下逐屏录入（不滚整页）...');
+
+  for (let step = 0; step < maxSteps; step++) {
+    const raw = await scanCommentsInFrame(frame);
+    const batch = rawScanResultsToComments(raw.results, null);
+
+    const newComments = batch
+      .filter((c) => {
+        const key = `${c.userId}_${c.time}_${c.content}`;
+        if (seenKeys.has(key)) return false;
+        seenKeys.add(key);
+        return true;
+      })
+      .sort((a, b) => a.time.localeCompare(b.time));
+
+    if (newComments.length > 0) {
+      allComments.push(...newComments);
+      if (onBatch) {
+        await onBatch(newComments, { step, totalSeen: seenKeys.size });
+      }
+      stagnant = 0;
+      console.log(`[浏览器] 向下录入 第 ${step + 1} 屏: 新增 ${newComments.length} 条，累计 ${seenKeys.size} 条`);
+    } else {
+      stagnant += 1;
+    }
+
+    const scroll = await scrollCommentListStep(frame, 'down');
+    if (!scroll.found) break;
+    await page.waitForTimeout(350);
+
+    if (scroll.atEnd && stagnant >= stagnantThreshold) break;
+    if (!scroll.moved && scroll.atEnd) break;
+    if (stagnant >= stagnantThreshold + 2) break;
+  }
+
+  const sorted = allComments.sort((a, b) => a.time.localeCompare(b.time));
+  if (sorted.length > 0) {
+    console.log(
+      `[浏览器] 从顶向下完成，共 ${sorted.length} 条；时间范围 ${sorted[0].time} ~ ${sorted[sorted.length - 1].time}`
+    );
+  } else {
+    console.log('[浏览器] 从顶向下完成，共 0 条');
+  }
+
+  return { comments: sorted, commentCount: sorted.length };
+}
+
+/**
+ * 启动兜底：滚动加载并合并整场直播目前已加载的全部评论（仅扫描，不查订单；兜底请用 processCommentsFromTopDown）
+ * @deprecated 兜底流程已改为从顶逐屏扫描+查订单，此函数仅供调试
  */
 async function scrollAndCollectAllComments(page) {
   const frame = await getContentFrame(page);
@@ -1468,42 +1594,28 @@ async function scrollAndCollectAllComments(page) {
     return added;
   };
 
-  // 先滚到顶部
-  for (let i = 0; i < 30; i++) {
-    const s = await scrollCommentListStep(frame, 'up');
-    if (!s.found || s.atTop) break;
-    await page.waitForTimeout(200);
-  }
+  // 1. 先纯向上拉 N 次，触发虚拟列表加载（此阶段不扫描）
+  const upResult = await scrollCommentListUp(page);
+  console.log(
+    `[浏览器] 已定位到顶部（滑动 ${upResult.upSteps} 次），开始全量扫描...`
+  );
 
-  let firstScan = await scanCommentsInFrame(frame);
-  mergeScan(firstScan.results);
-  console.log(`[浏览器] 兜底初始扫描: ${merged.size} 条`);
+  // 2. 到顶后统一扫描，再向下扫一遍覆盖全程
+  mergeScan((await scanCommentsInFrame(frame)).results);
+  console.log(`[浏览器] 顶部首扫: ${merged.size} 条`);
 
-  let stagnant = 0;
-  for (let step = 0; step < 150; step++) {
-    const scroll = await scrollCommentListStep(frame, 'down');
-    if (!scroll.found) break;
-    await page.waitForTimeout(350);
-
-    const scan = await scanCommentsInFrame(frame);
-    const added = mergeScan(scan.results);
-    if (added === 0) stagnant += 1;
-    else stagnant = 0;
-
-    if (step % 10 === 0) {
-      console.log(`[浏览器] 兜底滚动 step=${step}, 累计 ${merged.size} 条`);
-    }
-    if (scroll.atEnd && stagnant >= 3) break;
-    if (stagnant >= 6) break;
-    if (!scroll.moved && scroll.atEnd) break;
-  }
-
-  // 滚回评论列表底部，便于后续监控新评论（不滚主页面）
-  await scrollCommentListStep(frame, 'end');
-  await page.waitForTimeout(400);
+  await scrollCommentListCollectDown(page, { mergeScan });
 
   const comments = [...merged.values()].sort((a, b) => a.time.localeCompare(b.time));
-  console.log(`[浏览器] 兜底全量扫描完成，共 ${comments.length} 条去重评论`);
+  if (comments.length > 0) {
+    console.log(
+      `[浏览器] 兜底全量扫描完成，共 ${comments.length} 条；时间范围 ${comments[0].time} ~ ${comments[comments.length - 1].time}`
+    );
+  } else {
+    console.log('[浏览器] 兜底全量扫描完成，共 0 条去重评论');
+  }
+
+  const firstScan = await scanCommentsInFrame(frame);
   return { comments, debug: firstScan.debug };
 }
 
@@ -1819,8 +1931,13 @@ async function extractAllOrders(page) {
   try {
     const orders = await extractOrdersFromPopup(page);
     if (orders.length > 0) {
-      console.log(`[浏览器] 从已打开的订单弹窗读取 ${orders.length} 条（只读）`);
-      return orders;
+      const latest = pickLatestOrder(orders);
+      if (orders.length > 1) {
+        console.log(`[浏览器] 从已打开的订单弹窗读取 ${orders.length} 条，取支付/下单时间最新: ${latest.orderId}`);
+      } else {
+        console.log(`[浏览器] 从已打开的订单弹窗读取 1 条（只读）`);
+      }
+      return latest ? [latest] : orders;
     }
     return [];
   } catch (e) {
@@ -1862,9 +1979,108 @@ async function findCommentItemHandle(frame, comment) {
 }
 
 /**
- * 虚拟列表中滚动查找评论行（兜底扫描后 DOM 里可能没有目标行）
+ * 向上滑动 N 次，将「直播互动」列表定位到顶部。
+ * 仅做滚动定位，不扫描评论、不查订单；定位完成后由 processCommentsFromTopDown 录入一遍。
+ * @param {{ upSteps?: number }} opts
  */
-async function findCommentItemHandleWithScroll(frame, page, comment, maxSteps = 40) {
+async function scrollCommentListUp(page, opts = {}) {
+  const upSteps = opts.upSteps ?? config.monitor.backfillScrollUpSteps ?? 20;
+  const frame = await getContentFrame(page);
+
+  console.log(`[浏览器] 定位到顶部：在「直播互动」列表内向上滑动 ${upSteps} 次（不滚整页）...`);
+  await scrollCommentListStep(frame, 'end');
+  await page.waitForTimeout(400);
+
+  for (let i = 0; i < upSteps; i++) {
+    const scroll = await scrollCommentListStep(frame, 'up');
+    if (!scroll.found) {
+      console.log('[浏览器] 未找到「直播互动」评论列表滚动区，停止滑动（未滚整页控制台）');
+      break;
+    }
+    await page.waitForTimeout(400);
+    const stepNo = i + 1;
+    if (stepNo % 5 === 0 || stepNo === upSteps) {
+      console.log(`[浏览器] 定位 ${stepNo}/${upSteps}, scrollTop=${scroll.scrollTop}`);
+    }
+  }
+
+  await scrollCommentListStep(frame, 'top');
+  await page.waitForTimeout(300);
+  const state = await scrollCommentListStep(frame, 'read');
+
+  console.log(
+    `[浏览器] 定位完成（共滑动 ${upSteps} 次），scrollTop=${state.scrollTop ?? '?'}，到顶=${state.atTop ? '是' : '否'}`
+  );
+  if (!state.atTop) {
+    console.log('[浏览器] 提示: 滑动后仍未到顶，可在 .env 调大 BACKFILL_SCROLL_UP_STEPS');
+  }
+
+  return {
+    upSteps,
+    scrollTop: state.scrollTop ?? null,
+    atTop: !!state.atTop,
+  };
+}
+
+/**
+ * 从当前位置向下滚动并扫描，尽量覆盖到最新互动
+ */
+async function scrollCommentListCollectDown(page, { mergeScan, maxSteps = 200, stagnantThreshold = 6 } = {}) {
+  const frame = await getContentFrame(page);
+  let stagnant = 0;
+
+  for (let step = 0; step < maxSteps; step++) {
+    const scroll = await scrollCommentListStep(frame, 'down');
+    if (!scroll.found) break;
+    await page.waitForTimeout(350);
+
+    let added = 0;
+    if (mergeScan) {
+      added = mergeScan((await scanCommentsInFrame(frame)).results);
+    }
+    if (added === 0) stagnant += 1;
+    else stagnant = 0;
+
+    if (step % 15 === 0 && step > 0) {
+      console.log(`[浏览器] 向下补扫 step=${step}, 连续无新增 ${stagnant} 步`);
+    }
+
+    if (scroll.atEnd && stagnant >= stagnantThreshold) break;
+    if (!scroll.moved && scroll.atEnd) break;
+    if (stagnant >= stagnantThreshold + 2) break;
+  }
+}
+
+/**
+ * 将评论列表滚到顶部（查订单前使用，避免虚拟列表找不到历史行）
+ */
+async function scrollCommentListToTop(page, maxSteps = 50) {
+  const frame = await getContentFrame(page);
+  await scrollCommentListStep(frame, 'top');
+  await page.waitForTimeout(200);
+  for (let i = 0; i < maxSteps; i++) {
+    const s = await scrollCommentListStep(frame, 'up');
+    if (!s.found || (s.atTop && !s.moved)) break;
+    await page.waitForTimeout(150);
+  }
+  await scrollCommentListStep(frame, 'top');
+  await page.waitForTimeout(300);
+}
+
+/**
+ * 将评论列表滚到底部（监控新评论前使用）
+ */
+async function scrollCommentListToBottom(page) {
+  const frame = await getContentFrame(page);
+  await scrollCommentListStep(frame, 'end');
+  await page.waitForTimeout(400);
+}
+
+/**
+ * 虚拟列表中滚动查找评论行（兜底扫描后 DOM 里可能没有目标行）
+ * 先向上、再向下双向搜索，避免列表停在中间时漏找
+ */
+async function findCommentItemHandleWithScroll(frame, page, comment, maxSteps = 60) {
   let item = await findCommentItemHandle(frame, comment);
   if (item) return item;
 
@@ -1877,6 +2093,15 @@ async function findCommentItemHandleWithScroll(frame, page, comment, maxSteps = 
     if (!scroll.moved && scroll.atTop) break;
   }
 
+  for (let step = 0; step < maxSteps; step++) {
+    const scroll = await scrollCommentListStep(frame, 'down');
+    if (!scroll.found) break;
+    await page.waitForTimeout(350);
+    item = await findCommentItemHandle(frame, comment);
+    if (item) return item;
+    if (!scroll.moved && scroll.atEnd) break;
+  }
+
   return null;
 }
 
@@ -1887,13 +2112,13 @@ async function findCommentItemHandleWithScroll(frame, page, comment, maxSteps = 
  *
  * @returns {Object|null} 订单对象 { orderId, orderTime, paymentTime, productTitle }
  */
-async function viewOrderForComment(page, comment) {
+async function viewOrderForComment(page, comment, { maxFindSteps = 60 } = {}) {
   const frame = await getContentFrame(page);
   const hm = comment.time.substring(11, 16);
 
   let item = await findCommentItemHandle(frame, comment);
   if (!item) {
-    item = await findCommentItemHandleWithScroll(frame, page, comment);
+    item = await findCommentItemHandleWithScroll(frame, page, comment, maxFindSteps);
   }
 
   if (!item) {
@@ -1956,8 +2181,15 @@ async function viewOrderForComment(page, comment) {
     return null;
   }
 
-  console.log(`[浏览器] 订单: ${orders[0].orderId}`);
-  return orders[0];
+  const latest = pickLatestOrder(orders);
+  if (orders.length > 1) {
+    console.log(
+      `[浏览器] 共 ${orders.length} 条订单，取最新: ${latest.orderId}（支付 ${latest.paymentTime || latest.orderTime || '-'}）`
+    );
+  } else {
+    console.log(`[浏览器] 订单: ${latest.orderId}`);
+  }
+  return latest;
 }
 
 module.exports = {
@@ -1966,6 +2198,7 @@ module.exports = {
   findActivePage,
   isPageUsable,
   isRecoverablePageError,
+  closeBrowserSession,
   isCommentPanelStale,
   recoverControlPanel,
   refreshControlPanelPage,
@@ -1974,8 +2207,14 @@ module.exports = {
   getTransactionCount,
   getRecentComments,
   scrollAndCollectAllComments,
+  scrollCommentListUp,
+  processCommentsFromTopDown,
+  scrollCommentListToTop,
+  scrollCommentListToBottom,
   getOrdersFromTab,
   extractAllOrders,
   viewOrderForComment,
+  pickLatestOrder,
+  parseOrderTime,
   nowBeijing,
 };

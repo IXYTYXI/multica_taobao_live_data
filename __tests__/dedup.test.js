@@ -115,16 +115,16 @@ describe('订单去重逻辑', () => {
     const orderId = (matchedOrder?.orderId || '').trim();
     const paymentTime = matchedOrder?.paymentTime || '';
     if (!orderId) {
-      return { orderId: '', paymentTime: '' };
+      return { orderId: '', paymentTime: '', duplicate: false };
     }
-    if (recordedOrderIds.has(orderId) || batchOrderIds.has(orderId)) {
-      return { orderId: '', paymentTime: '', duplicate: true };
+    const duplicate = recordedOrderIds.has(orderId) || batchOrderIds.has(orderId);
+    if (!duplicate) {
+      batchOrderIds.add(orderId);
     }
-    batchOrderIds.add(orderId);
-    return { orderId, paymentTime, duplicate: false };
+    return { orderId, paymentTime, duplicate };
   }
 
-  test('同一订单号在本批次内只保留第一条', () => {
+  test('同一订单号第二条仍返回 orderId 但标记 duplicate', () => {
     const recorded = new Set();
     const batch = new Set();
     const order = { orderId: 'ORD999', paymentTime: '2026-07-10 14:25:00' };
@@ -133,19 +133,19 @@ describe('订单去重逻辑', () => {
     const second = resolveOrderFields(order, recorded, batch);
 
     expect(first.orderId).toBe('ORD999');
-    expect(first.duplicate).toBeFalsy();
-    expect(second.orderId).toBe('');
+    expect(first.duplicate).toBe(false);
+    expect(second.orderId).toBe('ORD999');
     expect(second.duplicate).toBe(true);
   });
 
-  test('已持久化的订单号不再写入', () => {
+  test('已持久化的订单号仍返回 orderId 供本条评论补写', () => {
     const recorded = new Set(['ORD888']);
     const batch = new Set();
     const order = { orderId: 'ORD888', paymentTime: '2026-07-10 14:25:00' };
 
     const result = resolveOrderFields(order, recorded, batch);
 
-    expect(result.orderId).toBe('');
+    expect(result.orderId).toBe('ORD888');
     expect(result.duplicate).toBe(true);
     expect(batch.size).toBe(0);
   });

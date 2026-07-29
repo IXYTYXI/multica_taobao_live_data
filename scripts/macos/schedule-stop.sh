@@ -18,11 +18,12 @@ fi
 
 if [ -n "$PM2" ] && "$PM2" describe "$PM2_NAME" &>/dev/null; then
   "$PM2" stop "$PM2_NAME"
+  sleep 3
 else
   echo "[schedule] $PM2_NAME 未在 pm2 中运行，跳过 stop"
 fi
 
-# 关闭本工具 chrome-data 目录对应的 Chrome（不影响日常浏览器）
+# 兜底：关闭本工具 chrome-data 目录对应的 Chrome（不影响日常浏览器）
 pkill -f "${PROJECT_DIR}/chrome-data" 2>/dev/null || true
 
 echo "[schedule] $(date '+%Y-%m-%d %H:%M:%S') 已停止 $PM2_NAME"

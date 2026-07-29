@@ -12,13 +12,14 @@ for /f "delims=" %%i in ('node -e "require('dotenv').config({path:require('path'
 pm2 describe %PM2_NAME% >nul 2>&1
 if not errorlevel 1 (
   pm2 stop %PM2_NAME%
+  timeout /t 3 /nobreak >nul
 ) else (
   echo [schedule] %PM2_NAME% 未在 pm2 中运行，跳过 stop
 )
 
-REM 关闭本工具 chrome-data 对应的 Chrome（不影响日常浏览器）
+REM 兜底：关闭本工具 chrome-data 对应的 Chrome（不影响日常浏览器）
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | Where-Object { $_.CommandLine -like '*chrome-data*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+  "$proj = '%PROJECT_DIR%'; Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | Where-Object { $_.CommandLine -and ($_.CommandLine -like ('*' + $proj + '*chrome-data*') -or $_.CommandLine -like '*chrome-data*') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
 
-echo [schedule] 已停止 taobao-live
+echo [schedule] 已停止 %PM2_NAME%
 exit /b 0
