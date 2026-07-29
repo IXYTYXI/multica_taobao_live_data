@@ -56,7 +56,9 @@ const PERIODIC_BACKFILL_STATE_FILE = path.join(DATA_DIR, 'periodic-backfill-stat
 const PENDING_ORDER_UPDATES_FILE = path.join(DATA_DIR, 'pending-order-updates.json');
 const COMMENTS_AWAITING_ORDER_FILE = path.join(DATA_DIR, 'comments-awaiting-order.json');
 /** 每轮监控最多对几条「已入库、仍缺订单」的评论再点「查看订单」（含不在 5 分钟窗口内的） */
-const MAX_AWAITING_ORDER_RETRY_PER_ROUND = 8;
+const MAX_AWAITING_ORDER_RETRY_PER_ROUND = 3;
+/** 监控里补查订单时滚动找行的步数（过大会长时间卡在单条评论上） */
+const MONITOR_ORDER_RETRY_FIND_STEPS = 18;
 
 const RECOVERY_COOLDOWN_MS = 60000;
 let lastRecoveryAttemptMs = 0;
@@ -612,7 +614,9 @@ async function buildRecordsFromComments(page, comments, batchOrderIds, { onProgr
       console.log(`[主程序] 处理: ${comment.nickname}(${comment.userId}) ${comment.time} - ${comment.content}`);
     }
 
-    const findSteps = maxFindSteps ?? 60;
+    const findSteps =
+      maxFindSteps ??
+      (needsOrderRetry && !isBackfill ? MONITOR_ORDER_RETRY_FIND_STEPS : 60);
     const matchedOrder = await viewOrderForComment(page, comment, { maxFindSteps: findSteps });
     const { orderId, paymentTime, duplicate } = resolveOrderFields(
       matchedOrder,
@@ -699,7 +703,7 @@ async function runScrollBackfill(page, { label, snapshotFile, kind = 'backfill' 
 
       const newRecords = await buildRecordsFromComments(page, batchComments, batchOrderIds, {
         mode: 'backfill',
-        maxFindSteps: 60,
+        maxFindSteps: 28,
         onProgress: async (done, total) => {
           if (snapshotFile && (done === total || done % 3 === 0)) {
             atomicWrite(snapshotFile, {
@@ -842,6 +846,43 @@ async function runPeriodicScrollBackfill(page) {
   saveLastPeriodicBackfillMs();
 }
 
+function commentToRecordKey(comment) {
+  return recordKey({
+    commenterID: comment.userId,
+    commentTime: comment.time,
+    commentContent: comment.content,
+  });
+}
+
+/**
+ * 监控轮询：先处理新评论，再限量处理待补订单，避免长时间卡在列表第一条补查上
+ */
+function prioritizeCommentsForMonitor(entries) {
+  const fresh = [];
+  const retry = [];
+  const skipRecorded = [];
+
+  for (const c of entries) {
+    const key = commentToRecordKey(c);
+    if (!recordedComments.has(key)) {
+      fresh.push(c);
+    } else if (isAwaitingOrder(key)) {
+      retry.push(c);
+    } else {
+      skipRecorded.push(c);
+    }
+  }
+
+  const retryBatch = retry.slice(0, MAX_AWAITING_ORDER_RETRY_PER_ROUND);
+  if (retry.length > retryBatch.length) {
+    console.log(
+      `[主程序] 时间窗内待补订单 ${retry.length} 条，本轮先处理 ${retryBatch.length} 条，其余下轮继续`
+    );
+  }
+
+  return [...fresh, ...retryBatch, ...skipRecorded];
+}
+
 /**
  * 扫描近期评论，处理新条目
  *
@@ -919,7 +960,8 @@ async function processNewComments(page) {
   }
 
   const batchOrderIds = new Set();
-  const newRecords = await buildRecordsFromComments(page, allEntries, batchOrderIds);
+  const orderedEntries = prioritizeCommentsForMonitor(allEntries);
+  const newRecords = await buildRecordsFromComments(page, orderedEntries, batchOrderIds);
 
   if (newRecords.length > 0) {
     console.log(`[主程序] 准备写入 ${newRecords.length} 条新记录到飞书...`);
