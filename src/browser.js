@@ -64,16 +64,269 @@ async function isStillLoginPage(page) {
 }
 
 /**
+ * 登录页辅助：尝试点击「密码登录 / 登录 / 提交」等入口（不自动填账号密码）
+ * 用于中间页只有登录按钮、未进入表单的情况；扫码/滑块仍需人工完成。
+ * @returns {Promise<boolean>} 是否点击了某个可识别入口
+ */
+async function tryAssistLoginClick(page) {
+  if (!config.browser.autoClickLogin) return false;
+
+  const payload = {
+    tabSelectors: ['a.password-login-tab-item', '.password-login-tab-item'],
+    tabTargets: ['密码登录', '账号密码登录', '账户密码登录'],
+    btnTargets: ['登录', '立即登录', '快速登录'],
+    submitSelectors: [
+      '#login-form button.fm-button.fm-submit.password-login',
+      '#login-form button[type="submit"]',
+      'button.fm-button.fm-submit.password-login',
+      '#J_SubmitStatic',
+      'button.fm-button',
+    ],
+  };
+
+  for (const frame of page.frames()) {
+    try {
+      const result = await frame.evaluate(({ tabSelectors, tabTargets, btnTargets, submitSelectors }) => {
+        function tryClick(el) {
+          if (!el || el.disabled) return false;
+          const rect = el.getBoundingClientRect();
+          if (rect.width < 16 || rect.height < 8) return false;
+          const style = window.getComputedStyle(el);
+          if (style.visibility === 'hidden' || style.display === 'none' || style.pointerEvents === 'none') {
+            return false;
+          }
+          el.click();
+          return true;
+        }
+
+        for (const sel of tabSelectors) {
+          const el = document.querySelector(sel);
+          if (el && tryClick(el)) return { ok: true, action: `tab:${sel}` };
+        }
+
+        for (const text of tabTargets) {
+          for (const el of document.querySelectorAll('a, button, span, div, li')) {
+            if (el.children.length > 3) continue;
+            if (el.textContent?.trim() !== text) continue;
+            if (tryClick(el)) return { ok: true, action: `tab:${text}` };
+          }
+        }
+
+        for (const sel of submitSelectors) {
+          const el = document.querySelector(sel);
+          if (el && tryClick(el)) return { ok: true, action: `submit:${sel}` };
+        }
+
+        for (const text of btnTargets) {
+          for (const el of document.querySelectorAll('button, a')) {
+            if (el.children.length > 2) continue;
+            const own = el.textContent?.trim();
+            if (own !== text) continue;
+            if (tryClick(el)) return { ok: true, action: `btn:${text}` };
+          }
+        }
+
+        return { ok: false };
+      }, payload);
+
+      if (result?.ok) {
+        console.log(`[浏览器] 已模拟点击登录相关按钮 (${result.action})`);
+        await page.waitForTimeout(1500);
+        return true;
+      }
+    } catch {
+      // iframe 跨域或未就绪
+    }
+  }
+
+  return false;
+}
+
+function maskLoginUser(user) {
+  if (!user) return '***';
+  if (user.length <= 2) return '***';
+  return `${user.slice(0, 2)}***`;
+}
+
+async function findFirstVisibleLocator(frame, selectors) {
+  for (const selector of selectors) {
+    const locator = frame.locator(selector).first();
+    try {
+      if ((await locator.count()) > 0 && (await locator.isVisible({ timeout: 400 }))) {
+        return locator;
+      }
+    } catch {
+      // 元素未就绪或不可见
+    }
+  }
+  return null;
+}
+
+/**
+ * 勾选淘宝登录页协议（havanaone: #fm-agreement-checkbox）
+ * @param {import('playwright').Frame} frame
+ */
+async function tryEnsureLoginAgreementChecked(frame) {
+  const agreementSelectors = ['#fm-agreement-checkbox', 'input[name="fm-agreement-checkbox"]'];
+  const agreement = await findFirstVisibleLocator(frame, agreementSelectors);
+  if (!agreement) return false;
+
+  try {
+    if (await agreement.isChecked()) return true;
+    await agreement.check({ force: true });
+    if (await agreement.isChecked()) return true;
+    await frame.locator('label[for="fm-agreement-checkbox"], .fm-agreement-text').first().click({ timeout: 2000 });
+    return await agreement.isChecked();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 检测点击登录后的下一步（滑块 / 图片验证码 / 错误提示）
+ * @param {import('playwright').Page} page
+ */
+async function detectLoginFollowUpHint(page) {
+  try {
+    return await page.evaluate(() => {
+      const errWrap = document.querySelector('#login-error');
+      const errText = document.querySelector('.login-error-msg')?.textContent?.trim() || '';
+      const errVisible = errWrap && getComputedStyle(errWrap).display !== 'none' && errText;
+
+      const baxia = document.querySelector('#baxia-password');
+      const baxiaIframe = document.querySelector('#baxia-dialog-content');
+      const hasSlider = !!(
+        baxia
+        && getComputedStyle(baxia).display !== 'none'
+        && baxiaIframe
+        && getComputedStyle(baxiaIframe).display !== 'none'
+      );
+
+      const checkcodeField = document.querySelector('#fm-login-checkcode')?.closest('.fm-field');
+      const hasImageCaptcha = !!(checkcodeField && getComputedStyle(checkcodeField).display !== 'none');
+
+      if (hasSlider) {
+        return { step: 'slider', message: '已出现滑块验证，请在浏览器中手动拖动「向右滑动验证」' };
+      }
+      if (hasImageCaptcha) {
+        return { step: 'image-captcha', message: '已出现图片验证码，请手动输入验证码' };
+      }
+      if (errVisible) {
+        return { step: 'error', message: `登录失败: ${errText}` };
+      }
+      return { step: 'none', message: null };
+    });
+  } catch {
+    return { step: 'unknown', message: null };
+  }
+}
+
+/**
+ * 登录页辅助：自动填写 .env 中的账号密码并提交（每轮 waitForLogin 仅尝试一次）
+ * 滑块、短信验证码等仍需人工完成。
+ * @param {import('playwright').Page} page
+ * @param {{ credentialsAttempted: boolean }} state
+ * @returns {Promise<boolean>}
+ */
+async function tryAutoFillLoginCredentials(page, state) {
+  if (state.credentialsAttempted) return false;
+  if (!config.browser.autoFillLogin) return false;
+
+  const { loginUser, loginPassword } = config.browser;
+  if (!loginUser || !loginPassword) return false;
+
+  await tryAssistLoginClick(page);
+  await page.waitForTimeout(800);
+
+  const userSelectors = [
+    '#fm-login-id',
+    'input[name="fm-login-id"]',
+    'input[name="TPL_username"]',
+  ];
+  const passwordSelectors = [
+    '#fm-login-password',
+    'input[name="fm-login-password"]',
+    'input[name="TPL_password"]',
+  ];
+  const submitSelectors = [
+    '#login-form button.fm-button.fm-submit.password-login',
+    '#login-form button[type="submit"]',
+    'button.fm-button.fm-submit.password-login',
+    '#J_SubmitStatic',
+    'button.fm-button',
+  ];
+
+  for (const frame of page.frames()) {
+    try {
+      const userInput = await findFirstVisibleLocator(frame, userSelectors);
+      const passwordInput = await findFirstVisibleLocator(frame, passwordSelectors);
+      if (!userInput || !passwordInput) continue;
+
+      await userInput.click({ timeout: 2000 });
+      await userInput.fill(loginUser);
+      await passwordInput.click({ timeout: 2000 });
+      await passwordInput.fill(loginPassword);
+
+      const agreementChecked = await tryEnsureLoginAgreementChecked(frame);
+      if (agreementChecked) {
+        console.log('[浏览器] 已勾选登录协议');
+      } else {
+        console.log('[浏览器] ⚠️ 未能勾选登录协议，登录按钮可能处于灰色不可点状态');
+      }
+
+      await page.waitForTimeout(300);
+
+      const submitBtn = await findFirstVisibleLocator(frame, submitSelectors);
+      if (submitBtn) {
+        await submitBtn.click({ timeout: 2000 });
+      } else {
+        await passwordInput.press('Enter');
+      }
+
+      state.credentialsAttempted = true;
+      console.log(
+        `[浏览器] 已自动填写账号 ${maskLoginUser(loginUser)} 并提交（滑块/短信验证仍需人工）`,
+      );
+      await page.waitForTimeout(2000);
+
+      const followUp = await detectLoginFollowUpHint(page);
+      if (followUp.message) {
+        console.log(`[浏览器] ${followUp.message}`);
+      }
+
+      return true;
+    } catch {
+      // iframe 跨域或未就绪，尝试下一 frame
+    }
+  }
+
+  return false;
+}
+
+/**
  * 等待用户完成登录，使用内容检测而非纯 URL 检测
  * 不设超时上限 — 浏览器保持打开，直到用户登录成功
  * @returns {boolean} 始终返回 true（无限等待直到登录成功）
  */
 async function waitForLogin(page) {
   let waitMinutes = 0;
+  let lastAssistClickMs = 0;
+  const assistIntervalMs = 15000;
+  const loginAssistState = { credentialsAttempted: false };
+
+  await tryAssistLoginClick(page);
+  await tryAutoFillLoginCredentials(page, loginAssistState);
+  lastAssistClickMs = Date.now();
+
   // eslint-disable-next-line no-constant-condition
   while (true) {
     await new Promise((r) => setTimeout(r, 3000));
     waitMinutes += 0.05; // ~3s
+
+    if (Date.now() - lastAssistClickMs >= assistIntervalMs) {
+      await tryAssistLoginClick(page);
+      lastAssistClickMs = Date.now();
+    }
 
     // 每分钟打印一次提示
     if (Math.floor(waitMinutes) > Math.floor(waitMinutes - 0.05) && Math.floor(waitMinutes) > 0) {
@@ -355,7 +608,11 @@ async function launchForLogin() {
 
   if (needLogin) {
     console.log('[浏览器] ⏳ 需要登录，请在浏览器中完成登录...');
-    console.log('[浏览器] 浏览器会保持打开，不会自动关闭，登录成功后自动继续');
+    if (config.browser.autoFillLogin) {
+      console.log('[浏览器] 已配置账号密码，将自动填表提交；滑块/短信验证仍需人工');
+    } else {
+      console.log('[浏览器] 将尝试自动点击登录入口；扫码/密码/滑块仍需人工完成');
+    }
 
     await waitForLogin(page);
 

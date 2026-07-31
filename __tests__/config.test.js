@@ -76,10 +76,29 @@ describe('config.js', () => {
     expect(config.browser.debugPort).toBe(9222);
   });
 
-  test('登录超时默认 300 秒', () => {
-    delete process.env.LOGIN_TIMEOUT;
+  test('未配置账号密码时不自动填表', () => {
+    delete process.env.TAOBAO_LOGIN_USER;
+    delete process.env.TAOBAO_LOGIN_PASSWORD;
+    delete process.env.AUTO_FILL_LOGIN;
     const config = require('../src/config');
-    expect(config.browser.loginTimeoutSeconds).toBe(300);
+    expect(config.browser.autoFillLogin).toBe(false);
+  });
+
+  test('配置账号密码后默认自动填表', () => {
+    process.env.TAOBAO_LOGIN_USER = 'test_user';
+    process.env.TAOBAO_LOGIN_PASSWORD = 'test_pass';
+    delete process.env.AUTO_FILL_LOGIN;
+    const config = require('../src/config');
+    expect(config.browser.autoFillLogin).toBe(true);
+    expect(config.browser.loginUser).toBe('test_user');
+  });
+
+  test('AUTO_FILL_LOGIN=false 时禁用自动填表', () => {
+    process.env.TAOBAO_LOGIN_USER = 'test_user';
+    process.env.TAOBAO_LOGIN_PASSWORD = 'test_pass';
+    process.env.AUTO_FILL_LOGIN = 'false';
+    const config = require('../src/config');
+    expect(config.browser.autoFillLogin).toBe(false);
   });
 
   test('淘宝直播列表 URL 正确', () => {

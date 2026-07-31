@@ -34,6 +34,19 @@ const config = {
 
     // 本工具自己的持久化浏览器数据目录（login 模式用）
     localDataDir: process.env.LOCAL_BROWSER_DATA_DIR || path.resolve(__dirname, '..', 'chrome-data'),
+
+    /** 停在登录页时尝试点击「登录/密码登录」等入口（不填账号密码） */
+    autoClickLogin: process.env.AUTO_CLICK_LOGIN !== 'false',
+
+    /** 淘宝账号（配合 TAOBAO_LOGIN_PASSWORD 可自动填表登录） */
+    loginUser: (process.env.TAOBAO_LOGIN_USER || '').trim(),
+    loginPassword: process.env.TAOBAO_LOGIN_PASSWORD || '',
+    /** 已配置账号密码且未设 AUTO_FILL_LOGIN=false 时自动填表提交 */
+    autoFillLogin: (() => {
+      if (process.env.AUTO_FILL_LOGIN === 'false') return false;
+      const user = (process.env.TAOBAO_LOGIN_USER || '').trim();
+      return !!(user && process.env.TAOBAO_LOGIN_PASSWORD);
+    })(),
   },
 
   // 淘宝直播中控台
