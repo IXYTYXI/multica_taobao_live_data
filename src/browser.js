@@ -177,10 +177,33 @@ async function tryEnsureLoginAgreementChecked(frame) {
 
   try {
     if (await agreement.isChecked()) return true;
+
+    const checked = await frame.evaluate(() => {
+      const agree = document.querySelector('#fm-agreement-checkbox');
+      if (!agree) return false;
+      if (agree.checked) return true;
+      agree.click();
+      if (agree.checked) return true;
+      document.querySelector('label[for="fm-agreement-checkbox"]')?.click();
+      return agree.checked;
+    });
+    if (checked) return true;
+
     await agreement.check({ force: true });
-    if (await agreement.isChecked()) return true;
-    await frame.locator('label[for="fm-agreement-checkbox"], .fm-agreement-text').first().click({ timeout: 2000 });
     return await agreement.isChecked();
+  } catch {
+    return false;
+  }
+}
+
+/** 登录按钮是否已从灰色变为可点 */
+async function isLoginSubmitReady(frame) {
+  try {
+    return await frame.evaluate(() => {
+      const btn = document.querySelector('#login-form button[type="submit"]');
+      if (!btn) return false;
+      return !btn.className.includes('button-low-light');
+    });
   } catch {
     return false;
   }
@@ -208,10 +231,13 @@ async function detectLoginFollowUpHint(page) {
       const baxia = document.querySelector('#baxia-password');
       const baxiaIframe = document.querySelector('#baxia-dialog-content');
       const hasSlider = !!(
-        baxia
-        && getComputedStyle(baxia).display !== 'none'
-        && baxiaIframe
-        && getComputedStyle(baxiaIframe).display !== 'none'
+        document.body.innerText.includes('向右滑动验证')
+        || (
+          baxia
+          && getComputedStyle(baxia).display !== 'none'
+          && baxiaIframe
+          && getComputedStyle(baxiaIframe).display !== 'none'
+        )
       );
 
       const checkcodeField = document.querySelector('#fm-login-checkcode')?.closest('.fm-field');
@@ -288,6 +314,17 @@ async function tryAutoFillLoginCredentials(page, state) {
 
       await page.waitForTimeout(300);
 
+      let submitReady = await isLoginSubmitReady(frame);
+      if (!submitReady) {
+        await tryEnsureLoginAgreementChecked(frame);
+        await page.waitForTimeout(300);
+        submitReady = await isLoginSubmitReady(frame);
+      }
+      if (!submitReady) {
+        console.log('[浏览器] ⚠️ 登录按钮仍为灰色，请检查协议是否勾选或账号密码是否已填写');
+        return false;
+      }
+
       const submitBtn = await findFirstVisibleLocator(frame, submitSelectors);
       if (submitBtn) {
         await submitBtn.click({ timeout: 2000 });
@@ -323,6 +360,7 @@ async function tryAutoFillLoginCredentials(page, state) {
 async function waitForLogin(page) {
   let waitMinutes = 0;
   let lastAssistClickMs = 0;
+  let lastFollowUpHintMs = 0;
   const assistIntervalMs = 15000;
   const loginAssistState = { credentialsAttempted: false };
 
@@ -336,8 +374,22 @@ async function waitForLogin(page) {
     waitMinutes += 0.05; // ~3s
 
     if (Date.now() - lastAssistClickMs >= assistIntervalMs) {
-      await tryAssistLoginClick(page);
+      // 已在密码登录表单上时不要反复点 Tab，避免重置协议勾选/表单
+      const passwordFormVisible = await page.locator('#fm-login-id').isVisible().catch(() => false);
+      if (!passwordFormVisible) {
+        await tryAssistLoginClick(page);
+      } else if (!loginAssistState.credentialsAttempted) {
+        await tryAutoFillLoginCredentials(page, loginAssistState);
+      }
       lastAssistClickMs = Date.now();
+    }
+
+    if (Date.now() - lastFollowUpHintMs >= 60000) {
+      const followUp = await detectLoginFollowUpHint(page);
+      if (followUp.message) {
+        console.log(`[浏览器] ${followUp.message}`);
+      }
+      lastFollowUpHintMs = Date.now();
     }
 
     // 每分钟打印一次提示
