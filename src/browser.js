@@ -39,6 +39,10 @@ async function isStillLoginPage(page) {
     if (url.includes('login.taobao.com') || url.includes('login.tmall.com')) {
       return true;
     }
+    // 账号密码通过后可能跳转到短信/身份验证页，尚未完成登录
+    if (url.includes('passport.taobao.com') && /identity_verify|\/iv\//.test(url)) {
+      return true;
+    }
     // URL 在 liveplatform 但页面可能还没加载完，检查内容
     const result = await page.evaluate(() => {
       const title = document.title || '';
@@ -188,6 +192,14 @@ async function tryEnsureLoginAgreementChecked(frame) {
  */
 async function detectLoginFollowUpHint(page) {
   try {
+    const url = page.url();
+    if (url.includes('passport.taobao.com') && /identity_verify|\/iv\//.test(url)) {
+      return {
+        step: 'sms-verify',
+        message: '已跳转到短信验证页，请点击「获取短信校验码」、输入验证码后点「确定」',
+      };
+    }
+
     return await page.evaluate(() => {
       const errWrap = document.querySelector('#login-error');
       const errText = document.querySelector('.login-error-msg')?.textContent?.trim() || '';

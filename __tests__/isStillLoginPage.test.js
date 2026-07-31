@@ -10,6 +10,9 @@ async function isStillLoginPage(page) {
     if (url.includes('login.taobao.com') || url.includes('login.tmall.com')) {
       return true;
     }
+    if (url.includes('passport.taobao.com') && url.includes('identity_verify')) {
+      return true;
+    }
     const result = await page.evaluate(() => {});
     if (result.hasLoginForm || result.hasLoginTitle || result.hasLoginCSS) {
       if (!result.hasLiveContent) {
@@ -37,6 +40,14 @@ describe('isStillLoginPage', () => {
 
   test('login.tmall.com URL → 是登录页', async () => {
     const page = createMockPage('https://login.tmall.com/login', {});
+    expect(await isStillLoginPage(page)).toBe(true);
+  });
+
+  test('passport 短信验证页 → 视为未完成登录', async () => {
+    const page = createMockPage(
+      'https://passport.taobao.com/iv/identity_verify.htm?htoken=xxx',
+      {},
+    );
     expect(await isStillLoginPage(page)).toBe(true);
   });
 
