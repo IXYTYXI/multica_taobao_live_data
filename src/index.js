@@ -111,21 +111,36 @@ function saveOrderDedup(set) {
   atomicWrite(ORDER_DEDUP_FILE, [...set]);
 }
 
+/** 同一用户 + 同一订单号只录入一次（持久化键） */
+function orderDedupKey(commenterID, orderId) {
+  return `${commenterID}::${orderId}`;
+}
+
+function markOrderRecorded(commenterID, orderId) {
+  if (!orderId) return;
+  recordedOrderIds.add(orderDedupKey(commenterID, orderId));
+}
+
 /**
- * 解析订单字段。同一订单号可写入多条评论（每条评论对照弹窗订单）。
- * duplicate 仅表示该订单号已在别行录入过，不再重复计入 order-dedup 统计。
+ * 解析订单字段。同一用户同一订单号只保留一条带订单的记录；
+ * 后续评论若弹窗仍返回该订单，则只写评论不写订单。
  */
-function resolveOrderFields(matchedOrder, recordedOrderIds, batchOrderIds) {
+function resolveOrderFields(matchedOrder, commenterID, recordedOrderIds, batchOrderIds) {
   const orderId = (matchedOrder?.orderId || '').trim();
   const paymentTime = matchedOrder?.paymentTime || '';
   if (!orderId) {
     return { orderId: '', paymentTime: '', duplicate: false };
   }
-  const duplicate = recordedOrderIds.has(orderId) || batchOrderIds.has(orderId);
-  if (!duplicate) {
-    batchOrderIds.add(orderId);
+  const dedupKey = orderDedupKey(commenterID, orderId);
+  const duplicate =
+    recordedOrderIds.has(dedupKey) ||
+    recordedOrderIds.has(orderId) ||
+    batchOrderIds.has(dedupKey);
+  if (duplicate) {
+    return { orderId: '', paymentTime: '', duplicate: true, skippedOrderId: orderId };
   }
-  return { orderId, paymentTime, duplicate };
+  batchOrderIds.add(dedupKey);
+  return { orderId, paymentTime, duplicate: false };
 }
 
 function loadOutbox() {
@@ -315,7 +330,7 @@ async function flushRecords(records, { isRetry = false } = {}) {
   for (const r of succeeded) {
     recordedComments.add(recordKey(r));
     if (r.orderId) {
-      recordedOrderIds.add(r.orderId);
+      markOrderRecorded(r.commenterID, r.orderId);
       clearCommentAwaitingOrder(r);
     } else if (!r._feishuUpdate) {
       markCommentAwaitingOrder(r);
@@ -367,7 +382,7 @@ async function flushOrderUpdates(records) {
     try {
       await updateBatchRecords(toUpdate);
       for (const { record } of toUpdate) {
-        if (record.orderId) recordedOrderIds.add(record.orderId);
+        if (record.orderId) markOrderRecorded(record.commenterID, record.orderId);
       }
       saveOrderDedup(recordedOrderIds);
       removePendingOrderUpdates(toUpdate.map(({ record }) => recordKey(record)));
@@ -509,10 +524,21 @@ async function verifyAndRepairMissingOrders(page, comments, batchOrderIds, { lab
     const matchedOrder = await viewOrderForComment(page, c, { maxFindSteps: 80 });
     const { orderId, paymentTime, duplicate } = resolveOrderFields(
       matchedOrder,
+      c.userId,
       recordedOrderIds,
       batchOrderIds
     );
-    if (!orderId) continue;
+    if (!orderId) {
+      if (duplicate) {
+        clearCommentAwaitingOrder({
+          commenterID: c.userId,
+          commenterName: c.nickname,
+          commentTime: c.time,
+          commentContent: c.content,
+        });
+      }
+      continue;
+    }
 
     repairRecords.push({
       commenterID: c.userId,
@@ -618,17 +644,29 @@ async function buildRecordsFromComments(page, comments, batchOrderIds, { onProgr
       maxFindSteps ??
       (needsOrderRetry && !isBackfill ? MONITOR_ORDER_RETRY_FIND_STEPS : 60);
     const matchedOrder = await viewOrderForComment(page, comment, { maxFindSteps: findSteps });
-    const { orderId, paymentTime, duplicate } = resolveOrderFields(
+    const { orderId, paymentTime, duplicate, skippedOrderId } = resolveOrderFields(
       matchedOrder,
+      comment.userId,
       recordedOrderIds,
       batchOrderIds
     );
     if (duplicate) {
-      console.log(`[主程序] 订单 ${orderId} 已在其他评论录入，本条仍写入订单号 ${orderId}`);
+      console.log(
+        `[主程序] 用户 ${comment.userId} 订单 ${skippedOrderId} 已录入，本条仅保留评论`
+      );
     }
 
     if (alreadyRecorded) {
       if (!orderId) {
+        if (duplicate) {
+          clearCommentAwaitingOrder({
+            commenterID: comment.userId,
+            commenterName: comment.nickname,
+            commentTime: comment.time,
+            commentContent: comment.content,
+          });
+          continue;
+        }
         markCommentAwaitingOrder({
           commenterID: comment.userId,
           commenterName: comment.nickname,
@@ -889,7 +927,7 @@ function prioritizeCommentsForMonitor(entries) {
  * 1. 仅在"全部"标签扫描，不来回切换标签
  * 2. 启动兜底已在 runStartupBackfill 中全量扫描；此处只处理时间窗口内新评论
  * 3. 每条新评论：悬停该行 → 点「查看订单」→ 有则写入订单，无则写评论并标记待补；已在 dedup 且待补的会在监控轮询中继续查单
- * 4. 同一订单号可出现在多条评论上（order-dedup 仅统计）
+ * 4. 同一用户同一 orderId 只保留一条带订单的记录
  */
 async function processNewComments(page) {
   const result = await getRecentComments(page, config.monitor.commentCheckMinutes, { syncAllVisible: false });

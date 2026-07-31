@@ -111,41 +111,65 @@ describe('记录构造逻辑', () => {
 });
 
 describe('订单去重逻辑', () => {
-  function resolveOrderFields(matchedOrder, recordedOrderIds, batchOrderIds) {
+  function orderDedupKey(commenterID, orderId) {
+    return `${commenterID}::${orderId}`;
+  }
+
+  function resolveOrderFields(matchedOrder, commenterID, recordedOrderIds, batchOrderIds) {
     const orderId = (matchedOrder?.orderId || '').trim();
     const paymentTime = matchedOrder?.paymentTime || '';
     if (!orderId) {
       return { orderId: '', paymentTime: '', duplicate: false };
     }
-    const duplicate = recordedOrderIds.has(orderId) || batchOrderIds.has(orderId);
-    if (!duplicate) {
-      batchOrderIds.add(orderId);
+    const dedupKey = orderDedupKey(commenterID, orderId);
+    const duplicate =
+      recordedOrderIds.has(dedupKey) ||
+      recordedOrderIds.has(orderId) ||
+      batchOrderIds.has(dedupKey);
+    if (duplicate) {
+      return { orderId: '', paymentTime: '', duplicate: true, skippedOrderId: orderId };
     }
-    return { orderId, paymentTime, duplicate };
+    batchOrderIds.add(dedupKey);
+    return { orderId, paymentTime, duplicate: false };
   }
 
-  test('同一订单号第二条仍返回 orderId 但标记 duplicate', () => {
+  test('同一用户同一订单号第二条不再写入订单', () => {
     const recorded = new Set();
     const batch = new Set();
     const order = { orderId: 'ORD999', paymentTime: '2026-07-10 14:25:00' };
 
-    const first = resolveOrderFields(order, recorded, batch);
-    const second = resolveOrderFields(order, recorded, batch);
+    const first = resolveOrderFields(order, 'user_a', recorded, batch);
+    const second = resolveOrderFields(order, 'user_a', recorded, batch);
 
     expect(first.orderId).toBe('ORD999');
     expect(first.duplicate).toBe(false);
-    expect(second.orderId).toBe('ORD999');
+    expect(second.orderId).toBe('');
     expect(second.duplicate).toBe(true);
+    expect(second.skippedOrderId).toBe('ORD999');
   });
 
-  test('已持久化的订单号仍返回 orderId 供本条评论补写', () => {
-    const recorded = new Set(['ORD888']);
+  test('不同用户相同订单号各自可录入（键不同）', () => {
+    const recorded = new Set();
+    const batch = new Set();
+    const order = { orderId: 'ORD999', paymentTime: '2026-07-10 14:25:00' };
+
+    const a = resolveOrderFields(order, 'user_a', recorded, batch);
+    batch.add(orderDedupKey('user_a', 'ORD999'));
+    recorded.add(orderDedupKey('user_a', 'ORD999'));
+    const b = resolveOrderFields(order, 'user_b', recorded, batch);
+
+    expect(a.orderId).toBe('ORD999');
+    expect(b.orderId).toBe('ORD999');
+  });
+
+  test('已持久化的用户订单不再重复写入', () => {
+    const recorded = new Set([orderDedupKey('user_a', 'ORD888')]);
     const batch = new Set();
     const order = { orderId: 'ORD888', paymentTime: '2026-07-10 14:25:00' };
 
-    const result = resolveOrderFields(order, recorded, batch);
+    const result = resolveOrderFields(order, 'user_a', recorded, batch);
 
-    expect(result.orderId).toBe('ORD888');
+    expect(result.orderId).toBe('');
     expect(result.duplicate).toBe(true);
     expect(batch.size).toBe(0);
   });
@@ -154,7 +178,7 @@ describe('订单去重逻辑', () => {
     const recorded = new Set();
     const batch = new Set();
 
-    const result = resolveOrderFields(null, recorded, batch);
+    const result = resolveOrderFields(null, 'user_a', recorded, batch);
 
     expect(result.orderId).toBe('');
     expect(result.paymentTime).toBe('');
@@ -164,8 +188,10 @@ describe('订单去重逻辑', () => {
     const recorded = new Set();
     const batch = new Set();
 
-    const first = resolveOrderFields({ orderId: 'ORD001', paymentTime: 't1' }, recorded, batch);
-    const second = resolveOrderFields({ orderId: 'ORD002', paymentTime: 't2' }, recorded, batch);
+    const first = resolveOrderFields({ orderId: 'ORD001', paymentTime: 't1' }, 'user_a', recorded, batch);
+    recorded.add(orderDedupKey('user_a', 'ORD001'));
+    batch.add(orderDedupKey('user_a', 'ORD001'));
+    const second = resolveOrderFields({ orderId: 'ORD002', paymentTime: 't2' }, 'user_a', recorded, batch);
 
     expect(first.orderId).toBe('ORD001');
     expect(second.orderId).toBe('ORD002');
