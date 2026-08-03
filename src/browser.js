@@ -892,14 +892,18 @@ async function refreshControlPanelPage(page) {
     return page;
   }
 
+  // 中控台有 WebSocket/轮询/埋点，networkidle 很难在 60s 内达成，部署机更易超时
+  const waitUntil = 'domcontentloaded';
+
   console.log('[浏览器] 刷新中控台页面...');
   try {
-    await page.reload({ waitUntil: 'networkidle', timeout: 60000 });
+    await page.reload({ waitUntil, timeout: 60000 });
   } catch (e) {
     console.log('[浏览器] reload 失败，尝试 goto:', e.message);
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 }).catch(() => {});
+    await page.goto(url, { waitUntil, timeout: 60000 }).catch(() => {});
   }
 
+  await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
   await page.waitForTimeout(8000);
   await ensureCommentTab(page, '全部');
   console.log('[浏览器] 中控台页面刷新完成');
